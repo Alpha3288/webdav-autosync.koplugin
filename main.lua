@@ -28,9 +28,9 @@ function WebDAVSync:init()
         general = true,
     })
     self.ui.menu:registerToMainMenu(self)
-    -- Run auto sync once at startup if enabled (and guard against re-runs on book open)
+    -- Run auto sync once at startup if enabled (only in file manager, not when opening a book)
     if G_reader_settings and G_reader_settings:isTrue("webdav_autosync_enabled") then
-        if not G_WebDAVSync_Has_Run then
+        if not self.ui.document and not G_WebDAVSync_Has_Run then  -- Only run if File Manager AND hasn't run yet
             G_WebDAVSync_Has_Run = true
             UIManager:scheduleIn(2, function()
                 self:doSync(true)
