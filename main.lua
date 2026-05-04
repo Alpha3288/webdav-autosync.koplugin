@@ -97,6 +97,47 @@ local function mark_close_run(book_rel)
     last_close_book_rel = book_rel
 end
 
+-- In-flight guard. Both book sync and progress sync mutate the same
+-- on-disk LuaSettings cache (webdav_autosync_state.lua). If a sync
+-- is paused on the conflict dialog and the user kicks off a second
+-- sync from the menu, both runs load cache_files independently, mutate
+-- their own copy, and the second flush clobbers the first's writes —
+-- with the visible failure mode of cache rows reverting and files being
+-- re-classified as "changed" on the next run. The guard is a single
+-- module-local boolean covering every sync flow (book one-way, book
+-- two-way, progress full-library, progress scoped close).
+--
+-- Held across the conflict dialog chain so a tap on "Sync books now"
+-- mid-conflict is rejected with a user-visible message rather than
+-- racing on save_cache. Cleared on every runner exit path.
+--
+-- Limitation: if a conflict dialog is dismissed via back-button or
+-- tap-outside (rather than picking a button), `finish()` is never
+-- called, the flag stays set, and subsequent auto syncs no-op until
+-- KOReader restarts. The cache flush leaks the same way regardless,
+-- so this isn't a regression — it's the same shape of pre-existing
+-- limitation, made visible by the new flag.
+local sync_in_flight = false
+
+local function check_in_flight(label, manual)
+    if not sync_in_flight then return false end
+    logger.info("webdav_autosync: " .. label .. " skip reason=already-in-flight")
+    if manual then
+        UIManager:show(InfoMessage:new{
+            text = _("A WebDAV sync is already in progress."),
+        })
+    end
+    return true
+end
+
+local function acquire_sync_lock()
+    sync_in_flight = true
+end
+
+local function release_sync_lock()
+    sync_in_flight = false
+end
+
 function WebDAVSync:init()
     Dispatcher:registerAction("webdav_sync_now", {
         category = "none",
@@ -645,6 +686,8 @@ function WebDAVSync:doSync(opts)
     local is_auto = opts.is_auto
     local turn_off_wifi = opts.turn_off_wifi
 
+    if check_in_flight("book sync", not is_auto) then return end
+
     local NetworkMgr = require("ui/network/manager")
     if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
         -- Auto triggers (startup, Resume) silently no-op when offline; only
@@ -716,6 +759,7 @@ function WebDAVSync:doSync(opts)
 end
 
 function WebDAVSync:runOneWaySync(ctx)
+    acquire_sync_lock()
     local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
     UIManager:show(syncing_msg)
     UIManager:forceRePaint()
@@ -743,9 +787,11 @@ function WebDAVSync:runOneWaySync(ctx)
     -- Files that did get written still trigger a refresh, even when err is set.
     self:notifyLibraryRefresh(ctx.folder, downloaded_rels)
     self:turnOffWifiIfRequested(ctx)
+    release_sync_lock()
 end
 
 function WebDAVSync:runTwoWaySync(ctx)
+    acquire_sync_lock()
     local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
     UIManager:show(syncing_msg)
     UIManager:forceRePaint()
@@ -759,6 +805,7 @@ function WebDAVSync:runTwoWaySync(ctx)
             text = T(_("Sync failed: %1"), tostring(err)),
         })
         self:turnOffWifiIfRequested(ctx)
+        release_sync_lock()
         return
     end
 
@@ -805,6 +852,7 @@ function WebDAVSync:runTwoWaySync(ctx)
             stats.conflicts_skipped, stats.failed))
         self:showTwoWaySummary(stats)
         self:turnOffWifiIfRequested(ctx)
+        release_sync_lock()
     end
 
     if #conflicts == 0 then
@@ -985,6 +1033,8 @@ function WebDAVSync:doProgressSync(opts)
     local on_done = opts.on_done
     local function done() if on_done then on_done() end end
 
+    if check_in_flight("progress sync", manual) then return done() end
+
     -- The per-event toggle gating happens in the event handlers (init,
     -- onResume) before they call us; manual entry points bypass the toggles
     -- entirely. So no toggle check here.
@@ -1069,6 +1119,8 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
     -- Gating (master + progress_on_close) is enforced by onCloseDocument
     -- before this runs; we don't re-check here.
 
+    if check_in_flight("close-trigger sync", false) then return end
+
     local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
     if meta_mode ~= "doc" then
         logger.dbg("webdav_autosync: close-trigger sync skip reason=metadata-folder-mode mode=" .. tostring(meta_mode))
@@ -1091,12 +1143,17 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
         return
     end
 
+    -- Past the cheap config gates: from here on we'll touch the cache and the
+    -- network, so claim the in-flight lock. Released on every exit below.
+    acquire_sync_lock()
+
     local username = self:getSetting("username", "")
     local password = self:getSetting("password", "")
     logger.info("webdav_autosync: close-trigger sync start book=" .. tostring(book_rel))
     local plan_obj, err = sync.plan_progress_book(server_url, username, password, local_folder, book_rel)
     if not plan_obj then
         logger.warn("webdav_autosync: close-trigger plan failed book=" .. tostring(book_rel) .. " err=" .. tostring(err))
+        release_sync_lock()
         return
     end
 
@@ -1128,6 +1185,7 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
         tostring(book_rel), downloaded, uploaded,
         plan_obj.actions.skipped_unchanged, plan_obj.actions.baselined,
         #plan_obj.actions.conflicts, failed))
+    release_sync_lock()
 end
 
 --- Run a full-library progress sync. Always interactive: shows the
@@ -1142,6 +1200,7 @@ function WebDAVSync:runProgressSync(opts)
     local on_done = opts.on_done
     local function done() if on_done then on_done() end end
 
+    acquire_sync_lock()
     local username = self:getSetting("username", "")
     local password = self:getSetting("password", "")
 
@@ -1157,6 +1216,7 @@ function WebDAVSync:runProgressSync(opts)
         UIManager:show(InfoMessage:new{
             text = T(_("Progress sync failed: %1"), tostring(err)),
         })
+        release_sync_lock()
         return done()
     end
 
@@ -1204,6 +1264,7 @@ function WebDAVSync:runProgressSync(opts)
             stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
             stats.conflicts_skipped, stats.failed))
         self:showProgressSummary(stats)
+        release_sync_lock()
         done()
     end
 
