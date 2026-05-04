@@ -168,18 +168,17 @@ function WebDAVSync:setWebDAVServer()
 end
 
 --- Open KOReader's cloud-storage picker and import the chosen WebDAV server.
---- Mirrors the pattern used by upstream plugins (statistics, vocabbuilder):
---- delegate to cloudstorage's own picker so the user can also pick a folder
---- inside the server, and store whatever it returns.
+--- Two routes depending on KOReader version:
+---   * Pre-2026.03: the cloudstorage plugin is attached to self.ui, expose
+---     onShowCloudStorageList(callback). Same path statistics.koplugin and
+---     vocabbuilder.koplugin used to take.
+---   * 2026.03+: plugins/cloudstorage.koplugin was removed; statistics and
+---     vocabbuilder migrated to SyncService:new{} with onConfirm. We do the
+---     same. The onConfirm callback receives a server table with the same
+---     shape as the legacy callback (name, type, address, username,
+---     password, url) so applyCloudStorageEntry handles both uniformly.
 function WebDAVSync:importFromCloudStorage()
-    local cs = self.ui.cloudstorage
-    if not cs or not cs.onShowCloudStorageList then
-        UIManager:show(InfoMessage:new{
-            text = _("KOReader's Cloud storage plugin is not available."),
-        })
-        return
-    end
-    cs:onShowCloudStorageList(function(server)
+    local handler = function(server)
         if not server then return end
         if server.type ~= "webdav" then
             UIManager:show(InfoMessage:new{
@@ -188,7 +187,26 @@ function WebDAVSync:importFromCloudStorage()
             return
         end
         self:applyCloudStorageEntry(server)
-    end)
+    end
+
+    local cs = self.ui.cloudstorage
+    if cs and cs.onShowCloudStorageList then
+        cs:onShowCloudStorageList(handler)
+        return
+    end
+
+    local ok, SyncService = pcall(require, "frontend/apps/cloudstorage/syncservice")
+    if ok and SyncService then
+        local picker = SyncService:new{}
+        picker.onClose = function(this) UIManager:close(this) end
+        picker.onConfirm = handler
+        UIManager:show(picker)
+        return
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = _("KOReader's Cloud storage feature is not available."),
+    })
 end
 
 function WebDAVSync:applyCloudStorageEntry(server)
