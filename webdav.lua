@@ -8,6 +8,7 @@ local ltn12 = require("ltn12")
 local socket = require("socket")
 local http = require("socket.http")
 local logger = require("logger")
+local util = require("util")
 -- Use KOReader's socketutil for timeouts (same as WebDavApi)
 local socketutil
 local ok_su = pcall(function() socketutil = require("socketutil") end)
@@ -319,14 +320,32 @@ local function list_all(base_url, username, password)
 end
 
 --- Download one file from WebDAV URL to local path. Creates parent dirs.
---- Returns true, or nil, error_message. Same request pattern as WebDavApi:downloadFile.
+--- Returns true, or nil, error_message. Streams the response straight to
+--- disk via ltn12.sink.file — books on a typical KOReader library can be
+--- 50–500 MB and pre-v1.7.1 the response was buffered in a Lua table for
+--- the entire download, OOMing on devices with limited RAM (Kindle/Kobo
+--- often run with 256–512 MB total). Parent directories are created with
+--- util.makePath (recursive); plain lfs.mkdir failed for nested sidecar
+--- paths whose intermediate dirs hadn't been touched yet (fresh install,
+--- or first time syncing into a new subfolder). Side effect of streaming:
+--- a request that fails mid-transfer leaves a truncated file on disk,
+--- where the old buffered approach would leave nothing — we delete it on
+--- non-2xx so the next sync re-downloads cleanly rather than treating
+--- the partial file as legitimate local content.
 local function download_file(remote_url, local_path, username, password)
     local url = url_encode(normalize_url(remote_url))
-    local body = {}
+    local lpath = local_path
+    local dir = lpath:match("^(.+)/[^/]+$")
+    if dir then
+        local ok_mp, mp_err = util.makePath(dir)
+        if not ok_mp then return nil, mp_err end
+    end
+    local f, ferr = io.open(lpath, "wb")
+    if not f then return nil, ferr end
     local request = {
         url = url,
         method = "GET",
-        sink = ltn12.sink.table(body),
+        sink = ltn12.sink.file(f), -- closes f on EOF/error
         user = (username and username ~= "") and username or nil,
         password = (password and password ~= "") and password or nil,
     }
@@ -339,28 +358,9 @@ local function download_file(remote_url, local_path, username, password)
     end
     logger.dbg("webdav_autosync: GET url=" .. url .. " status=" .. tostring(code))
     if type(code) ~= "number" or code ~= 200 then
+        os.remove(lpath)
         return nil, "HTTP " .. tostring(code)
     end
-    -- Use path as-is if absolute, else relative to KOReader data dir
-    local lpath = local_path
-    if not lpath:match("^/") then
-        local ok, DataStorage = pcall(require, "datastorage")
-        if ok and DataStorage and DataStorage.getRealPath then
-            lpath = DataStorage:getRealPath(local_path)
-        end
-    end
-    local dir = lpath:match("^(.+)/[^/]+$")
-    if dir then
-        local ok, lfs = pcall(require, "libs/libkoreader-lfs")
-        if not ok then lfs = require("lfs") end
-        if lfs and lfs.mkdir then lfs.mkdir(dir) end
-    end
-    local f, err = io.open(lpath, "wb")
-    if not f then return nil, err end
-    for _, chunk in ipairs(body) do
-        f:write(chunk)
-    end
-    f:close()
     return true
 end
 
