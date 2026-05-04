@@ -98,6 +98,10 @@ Sync downloads **all files** under the server URL recursively; subfolders are re
 - **Network**: silent triggers and auto interactive triggers no-op when offline (no Wi-Fi prompt during close/wake/startup). Manual sync prompts to enable Wi-Fi if needed.
 - **Device-specific paths inside sidecars are normal.** A freshly downloaded `metadata.<ext>.lua` will still show the source device's `doc_path` and a `-- /…/metadata.<ext>.lua` header comment pointing at the source device's filesystem. KOReader rewrites both on the first open of the book on the destination device, so reading position, bookmarks, highlights, etc. all consume cleanly — the stale paths are cosmetic. The plugin deliberately does not edit sidecar contents in flight.
 
+## Troubleshooting
+
+Every log line emitted by the plugin starts with `webdav_autosync:`, so a single `grep webdav_autosync /path/to/koreader/crash.log` surfaces the full trail. By default you'll see info-level entries — trigger names (`trigger=close|resume|startup|manual_*`), sync start, and sync done with counts. Enable **Tools → More tools → Developer options → Enable debug logging** before reproducing to also capture per-file diff decisions, per-action HTTP outcomes, gating reasons (cooldown, toggle off, offline, etc.), and individual WebDAV requests.
+
 ## Requirements
 
 - KOReader with LuaSocket (and HTTPS support for `https://` URLs).
