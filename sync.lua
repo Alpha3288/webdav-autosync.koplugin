@@ -110,11 +110,12 @@ local function rel_from_remote_path(path, base)
 end
 
 --- Recursively collect local files under `folder`. Returns table keyed by
---- relpath -> { path = absolute, mtime = number, size = number, hash = string? }.
+--- relpath -> { path = absolute, mtime = number, size = number }.
 --- The predicate decides which entries to keep; it receives (entry_name, relpath).
---- When `compute_hash` is true, also fingerprints the file content via
---- `util.partialMD5` (cheap for tiny sidecars; never call this for large books).
-local function walk_local(folder, predicate, compute_hash)
+--- Hashing is intentionally NOT done here — see `hash_local_sidecars`, which
+--- the sidecar-aware callers run as a separate pass so they can pass a cache
+--- table and skip MD5 of files that haven't changed since the last sync.
+local function walk_local(folder, predicate)
     local lfs = load_lfs()
     local out = {}
     local function recurse(dir, prefix)
@@ -134,9 +135,6 @@ local function walk_local(folder, predicate, compute_hash)
                             mtime = attr.modification,
                             size = attr.size,
                         }
-                        if compute_hash then
-                            out[rel].hash = util.partialMD5(full)
-                        end
                     end
                 end
             end
@@ -169,12 +167,43 @@ local function is_syncable_sidecar(rel)
     return is_sidecar_path(rel) and not rel:match("%.old$")
 end
 
+--- Resolve a content hash for one walk-result entry. Reuses the cached hash
+--- when (size, mtime) exactly match the cache row — for an untouched sidecar
+--- this avoids opening the file at all. The "verbatim rewrite" case
+--- (KOReader rewrites byte-identical content but mtime advances) still
+--- hashes via partialMD5 because mtime won't match cache; that's the case
+--- the content hash was added for in v1.5.2 and stays covered. Pre-v1.5.2
+--- cache rows lack `local_hash`, so they also fall through to partialMD5.
+--- `cache_row` may be nil (no prior cache entry); always returns a hash.
+local function resolve_sidecar_hash(info, cache_row)
+    if cache_row and cache_row.local_hash
+            and cache_row.local_size == info.size
+            and (cache_row.local_mtime or 0) == (info.mtime or 0) then
+        return cache_row.local_hash
+    end
+    return util.partialMD5(info.path)
+end
+
+--- Populate `info.hash` for every walk-result entry, looking up `cache_files`
+--- by the global relpath (which equals the table key) so unchanged sidecars
+--- are answered from the cache without disk reads. Mutates `out` in place.
+local function hash_local_sidecars(out, cache_files)
+    for rel, info in pairs(out) do
+        info.hash = resolve_sidecar_hash(info, cache_files and cache_files[rel])
+    end
+end
+
 --- Collect every regular file inside any `*.sdr/` directory under `folder`,
 --- minus `.old` backup files. Sidecars are content-hashed because KOReader
 --- can rewrite them verbatim during normal operation (mtime advances, bytes
 --- unchanged) — only the hash distinguishes a real edit from a no-op rewrite.
-local function walk_local_sidecars(folder)
-    return walk_local(folder, function(_, rel) return is_syncable_sidecar(rel) end, true)
+--- When `cache_files` is provided, hashes for entries whose (size, mtime)
+--- match the cache row are reused without re-reading the file (see
+--- `resolve_sidecar_hash`).
+local function walk_local_sidecars(folder, cache_files)
+    local out = walk_local(folder, function(_, rel) return is_syncable_sidecar(rel) end)
+    hash_local_sidecars(out, cache_files)
+    return out
 end
 
 local function open_cache()
@@ -574,6 +603,11 @@ local function plan_progress_book(server_url, username, password, local_folder, 
         end
     end
 
+    -- Load cache before hashing so unchanged sidecars can answer from the
+    -- cache without re-reading the file (same optimization as plan_progress).
+    local cache = open_cache()
+    local cache_files = load_cache_files(cache)
+
     local remote_index = build_remote_index(list, server_url, function(rel)
         return is_syncable_sidecar(rel)
     end)
@@ -582,16 +616,14 @@ local function plan_progress_book(server_url, username, password, local_folder, 
     -- be relative to local_folder so cache keys match what
     -- plan_progress (full walk) writes.
     local local_index = {}
-    local sub_files = walk_local(local_folder .. "/" .. sdr_rel, function() return true end, true)
+    local sub_files = walk_local(local_folder .. "/" .. sdr_rel, function() return true end)
     for sub_rel, info in pairs(sub_files) do
         local full_rel = sdr_rel .. "/" .. sub_rel
         if is_syncable_sidecar(full_rel) then
+            info.hash = resolve_sidecar_hash(info, cache_files[full_rel])
             local_index[full_rel] = info
         end
     end
-
-    local cache = open_cache()
-    local cache_files = load_cache_files(cache)
 
     local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
             server_url, local_folder)
@@ -627,13 +659,15 @@ local function plan_progress(server_url, username, password, local_folder)
         return nil, "List failed: " .. tostring(code) .. " " .. tostring(err)
     end
 
+    -- Load cache before walking so walk_local_sidecars can skip MD5 on
+    -- sidecars whose (size, mtime) match their cache row from the prior sync.
+    local cache = open_cache()
+    local cache_files = load_cache_files(cache)
+
     local remote_index = build_remote_index(list, server_url, function(rel)
         return is_syncable_sidecar(rel)
     end)
-    local local_index = walk_local_sidecars(local_folder)
-
-    local cache = open_cache()
-    local cache_files = load_cache_files(cache)
+    local local_index = walk_local_sidecars(local_folder, cache_files)
 
     local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
             server_url, local_folder)
