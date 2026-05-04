@@ -783,7 +783,6 @@ function WebDAVSync:doProgressSync(opts)
             server_url = server_url,
             local_folder = local_folder,
             interactive = interactive,
-            manual = false,
             on_done = on_done,
         })
         return
@@ -807,7 +806,6 @@ function WebDAVSync:doProgressSync(opts)
         server_url = server_url,
         local_folder = local_folder,
         interactive = true,
-        manual = true,
         on_done = on_done,
     })
 end
@@ -860,15 +858,19 @@ function WebDAVSync:runProgressSync(opts)
     local server_url = opts.server_url
     local local_folder = opts.local_folder
     local interactive = opts.interactive
-    local manual = opts.manual
     local on_done = opts.on_done
     local function done() if on_done then on_done() end end
 
     local username = self:getSetting("username", "")
     local password = self:getSetting("password", "")
 
+    -- All three callers of runProgressSync (startup, Resume, manual) are
+    -- interactive — silent close-trigger syncs go through doProgressSyncForBook
+    -- instead. Show the syncing/summary/failure UI on every interactive run so
+    -- it matches book sync's behavior and silent plan errors don't disappear
+    -- into a debug log.
     local syncing_msg
-    if manual then
+    if interactive then
         syncing_msg = InfoMessage:new{ text = _("Syncing reading progress…") }
         UIManager:show(syncing_msg)
         UIManager:forceRePaint()
@@ -877,7 +879,7 @@ function WebDAVSync:runProgressSync(opts)
     local plan_obj, err = sync.plan_progress(server_url, username, password, local_folder)
     if not plan_obj then
         if syncing_msg then UIManager:close(syncing_msg) end
-        if manual then
+        if interactive then
             UIManager:show(InfoMessage:new{
                 text = T(_("Progress sync failed: %1"), tostring(err)),
             })
@@ -921,7 +923,7 @@ function WebDAVSync:runProgressSync(opts)
     local conflicts = plan_obj.actions.conflicts
     local function finish()
         sync.save_cache(plan_obj)
-        if manual then self:showProgressSummary(stats) end
+        if interactive then self:showProgressSummary(stats) end
         done()
     end
 
