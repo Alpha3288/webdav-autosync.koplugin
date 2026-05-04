@@ -5,6 +5,7 @@ Sync files from a WebDAV server to your device. Optional credentials, configurab
 ## Features
 
 - **WebDAV connection** – Server URL with optional username/password (Basic auth).
+- **Import from KOReader cloud storage** – If you already configured a WebDAV server under KOReader's built-in *Cloud storage* feature, pick it from KOReader's own picker (which also lets you choose a folder inside the server) and the URL and credentials are copied over automatically. The local download folder is always chosen separately.
 - **Download folder** – Opens KOReader’s file explorer; navigate and long-press a folder to select it (no typing paths).
 - **File extensions (optional)** – Sync only files with given extensions (e.g. `epub, pdf, txt`). Leave empty to sync all formats KOReader supports (EPUB, PDF, DjVu, XPS, CBT, CBZ, CB7, FB2, PDB, TXT, HTML, RTF, CHM, DOC, MOBI, ZIP, MD).
 - **Auto sync** – When enabled, sync runs once when KOReader starts.
@@ -19,7 +20,7 @@ Sync files from a WebDAV server to your device. Optional credentials, configurab
 ## Usage
 
 1. Open the main menu → **WebDAV Sync**.
-2. **Set server URL** – Your WebDAV base URL (e.g. `https://example.com/webdav`).
+2. **Set server URL** – Your WebDAV base URL (e.g. `https://example.com/webdav`). You can skip this step and use **Import from KOReader cloud storage** to copy the URL and credentials from a server you already configured under KOReader's built-in cloud storage; you'll be able to drill into a specific subfolder during the pick.
 3. **Set credentials (optional)** – Username and password if the server requires auth.
 4. **Choose download folder** – Opens the file browser; navigate to a folder and long-press it to select it as the download location.
 5. **Set file extensions (optional)** – Comma- or space-separated list (e.g. `epub, pdf, txt`). Leave empty to sync all KOReader-supported formats.

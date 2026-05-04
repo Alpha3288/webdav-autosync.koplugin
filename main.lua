@@ -59,6 +59,13 @@ function WebDAVSync:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("Import from KOReader cloud storage"),
+                keep_menu_open = true,
+                callback = function()
+                    self:importFromCloudStorage()
+                end,
+            },
+            {
                 text = _("Choose download folder"),
                 keep_menu_open = true,
                 callback = function()
@@ -146,6 +153,50 @@ function WebDAVSync:setWebDAVServer()
     if not ok then
         UIManager:show(InfoMessage:new{ text = T(_("Error opening dialog: %1"), tostring(err)) })
     end
+end
+
+--- Open KOReader's cloud-storage picker and import the chosen WebDAV server.
+--- Mirrors the pattern used by upstream plugins (statistics, vocabbuilder):
+--- delegate to cloudstorage's own picker so the user can also pick a folder
+--- inside the server, and store whatever it returns.
+function WebDAVSync:importFromCloudStorage()
+    local cs = self.ui.cloudstorage
+    if not cs or not cs.onShowCloudStorageList then
+        UIManager:show(InfoMessage:new{
+            text = _("KOReader's Cloud storage plugin is not available."),
+        })
+        return
+    end
+    cs:onShowCloudStorageList(function(server)
+        if not server then return end
+        if server.type ~= "webdav" then
+            UIManager:show(InfoMessage:new{
+                text = _("Please pick a WebDAV server (other server types are not supported)."),
+            })
+            return
+        end
+        self:applyCloudStorageEntry(server)
+    end)
+end
+
+function WebDAVSync:applyCloudStorageEntry(server)
+    -- The cloudstorage callback returns: name, type, address, username,
+    -- password, url. `address` is the server base, `url` is the folder path
+    -- the user navigated to inside the picker.
+    local server_url = (server.address or ""):gsub("/+$", "")
+    local start = server.url or ""
+    if start ~= "" then
+        if not start:match("^/") then start = "/" .. start end
+        server_url = server_url .. start
+    end
+    self:saveSetting("server_url", server_url)
+    self:saveSetting("username", server.username or "")
+    self:saveSetting("password", server.password or "")
+
+    local label = (server.name and server.name ~= "") and server.name or (server.address or "")
+    UIManager:show(InfoMessage:new{
+        text = T(_("Imported WebDAV server '%1'."), label),
+    })
 end
 
 function WebDAVSync:setDownloadFolder()
