@@ -39,27 +39,12 @@ local function url_has_host(url)
     return host and host ~= ""
 end
 
---- Build request headers for WebDAV (no auth here - use user/password in request table like WebDavApi).
-local function headers(extra)
-    local h = {
-        ["Content-Type"] = "application/xml",
-        ["Depth"] = "1",
-    }
-    if extra then
-        for k, v in pairs(extra) do
-            h[k] = v
-        end
-    end
-    return h
-end
-
 --- PROPFIND body: use empty/minimal like KOReader WebDavApi (some servers expect it).
 local PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><allprop/></propfind>'
 
 --- Parse PROPFIND XML response into list of { href, is_collection, path }.
 --- Accept any namespace prefix like WebDavApi (<*:response>, <*:href>, etc.).
-local function parse_propfind_response(body, base_url)
-    local base = base_url:gsub("^https?://[^/]+", ""):gsub("/*$", "") .. "/"
+local function parse_propfind_response(body)
     local list = {}
     for block in (body or ""):gmatch("<[^:]*:response[^>]*>.-</[^:]*:response>") do
         local href = block:match("<[^:]*:href[^>]*>([^<]+)</[^:]*:href>")
@@ -85,7 +70,7 @@ end
 
 --- List a WebDAV URL (single level). Returns list of { href, is_collection, path }.
 --- Matches KOReader WebDavApi: trailing slash on URL, empty body, Content-Length, user/password, socketutil.
-function list_one(url, username, password, depth)
+local function list_one(url, username, password, depth)
     url = normalize_url(url)
     if not url_has_host(url) then
         return nil, nil, "host or service not provided, or not known"
@@ -112,7 +97,7 @@ function list_one(url, username, password, depth)
     if socketutil and socketutil.set_timeout then
         socketutil:set_timeout()
     end
-    local code, resp_headers, status = socket.skip(1, http.request(request))
+    local code, _, status = socket.skip(1, http.request(request))
     if socketutil and socketutil.reset_timeout then
         socketutil:reset_timeout()
     end
@@ -120,12 +105,12 @@ function list_one(url, username, password, depth)
     if type(code) ~= "number" or code < 200 or code > 299 then
         return nil, code or status, body_str or tostring(status)
     end
-    return parse_propfind_response(body_str, url), code
+    return parse_propfind_response(body_str), code
 end
 
 --- Recursively collect all file URLs under base_url (directories traversed).
 --- Returns flat list of { href, is_collection, path } for all resources.
-function list_all(base_url, username, password)
+local function list_all(base_url, username, password)
     base_url = normalize_url(base_url)
     local base_domain = base_url:match("^(https?://[^/]+)")
     local all = {}
@@ -160,7 +145,7 @@ end
 
 --- Download one file from WebDAV URL to local path. Creates parent dirs.
 --- Returns true, or nil, error_message. Same request pattern as WebDavApi:downloadFile.
-function download_file(remote_url, local_path, username, password)
+local function download_file(remote_url, local_path, username, password)
     local url = url_encode(normalize_url(remote_url))
     local body = {}
     local request = {

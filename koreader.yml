@@ -1,0 +1,44 @@
+---
+# Selene standard-library file for KOReader plugin development.
+#
+# KOReader runs on LuaJIT 2.1 with the LUAJIT_ENABLE_LUA52COMPAT flag, which
+# adds some Lua 5.2 features on top of selene's `lua51` base. This file fills
+# in those gaps and declares the small set of globals injected by the
+# KOReader runtime that plugins legitimately read.
+#
+# Activate with `std = "lua51+koreader"` in selene.toml. Drop this file
+# alongside selene.toml when starting a new koplugin.
+
+base: lua51
+
+globals:
+  # --- KOReader runtime globals ---------------------------------------------
+  # Persistent settings store, written to settings.reader.lua.
+  G_reader_settings:
+    any: true
+  # Built-in defaults loaded from defaults.lua / defaults.persistent.lua.
+  G_defaults:
+    any: true
+
+  # --- LuaJIT extensions over Lua 5.1 ---------------------------------------
+  # bitop module, auto-loaded by LuaJIT.
+  bit:
+    any: true
+  # jit table (status, version, opt, etc.), auto-loaded by LuaJIT.
+  jit:
+    any: true
+  # Lua 5.2 environment table, available under LUAJIT_ENABLE_LUA52COMPAT.
+  _ENV:
+    any: true
+
+  # --- table.pack / table.unpack (Lua 5.2+, present in LuaJIT) --------------
+  table.pack:
+    args:
+      - type: "..."
+  table.unpack:
+    args:
+      - type: table
+      - type: number
+        required: false
+      - type: number
+        required: false

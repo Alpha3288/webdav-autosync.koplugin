@@ -1,0 +1,14 @@
+# Selene config for a KOReader plugin. See https://kampfkarren.github.io/selene/
+#
+# The std string composes selene's built-in `lua51` library with the
+# project-local `koreader.yml`, which declares KOReader/LuaJIT globals.
+std = "lua51+koreader"
+
+[lints]
+# KOReader code idiomatically uses one-liners like `if not foo then return end`
+# and `do f(); g() end`. Don't flag them.
+multiple_statements = "allow"
+
+# `local function fn(self, _unused) ... end` is normal at API boundaries.
+# selene's default ignore_pattern (^_) already covers _-prefixed unused locals,
+# matching KOReader's `__`-prefixed convention as well.

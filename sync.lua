@@ -57,7 +57,7 @@ end
 --- local_folder: path on device (e.g. /mnt/onboard/books or relative path).
 --- extensions_filter: optional string (e.g. "epub, pdf"); empty/nil = all KOReader formats.
 --- Returns: count_downloaded, count_skipped, error_message (nil on success).
-function run_sync(server_url, username, password, local_folder, progress_cb, extensions_filter)
+local function run_sync(server_url, username, password, local_folder, progress_cb, extensions_filter)
     if not server_url or type(server_url) ~= "string" then
         return 0, 0, "Server URL is not set"
     end
@@ -99,7 +99,7 @@ function run_sync(server_url, username, password, local_folder, progress_cb, ext
             rel = rel:sub(#base + 1):gsub("^/+", "")
         end
         local local_path = local_folder .. "/" .. rel
-        
+
         -- Check if file already exists locally
         local file_exists = false
         local f = io.open(local_path, "r")
@@ -107,7 +107,7 @@ function run_sync(server_url, username, password, local_folder, progress_cb, ext
             f:close()
             file_exists = true
         end
-        
+
         if file_exists then
             count_skipped = count_skipped + 1
         else
@@ -115,7 +115,7 @@ function run_sync(server_url, username, password, local_folder, progress_cb, ext
             local ok, msg = webdav.download_file(remote_url, local_path, username, password)
             if ok then
                 count_ok = count_ok + 1
-                
+
                 -- For EPUB files, try to rename based on metadata title
                 local ext = local_path:match("%.([^%.]+)$")
                 if ext and ext:lower() == "epub" then
@@ -124,7 +124,7 @@ function run_sync(server_url, username, password, local_folder, progress_cb, ext
                         -- Build new path with title as filename
                         local dir = local_path:match("^(.+)/[^/]+$") or local_folder
                         local new_path = dir .. "/" .. title .. ".epub"
-                        
+
                         -- Rename file (this will overwrite if duplicate exists)
                         local rename_ok = os.rename(local_path, new_path)
                         if not rename_ok then

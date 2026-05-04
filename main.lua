@@ -20,6 +20,9 @@ local WebDAVSync = WidgetContainer:extend{
     is_doc_only = false,
 }
 
+-- Guards against running auto-sync more than once per KOReader session.
+local auto_sync_started = false
+
 function WebDAVSync:init()
     Dispatcher:registerAction("webdav_sync_now", {
         category = "none",
@@ -29,13 +32,12 @@ function WebDAVSync:init()
     })
     self.ui.menu:registerToMainMenu(self)
     -- Run auto sync once at startup if enabled (only in file manager, not when opening a book)
-    if G_reader_settings and G_reader_settings:isTrue("webdav_autosync_enabled") then
-        if not self.ui.document and not G_WebDAVSync_Has_Run then  -- Only run if File Manager AND hasn't run yet
-            G_WebDAVSync_Has_Run = true
-            UIManager:scheduleIn(2, function()
-                self:doSync(true)
-            end)
-        end
+    if G_reader_settings and G_reader_settings:isTrue("webdav_autosync_enabled")
+            and not self.ui.document and not auto_sync_started then
+        auto_sync_started = true
+        UIManager:scheduleIn(2, function()
+            self:doSync()
+        end)
     end
 end
 
@@ -46,7 +48,7 @@ function WebDAVSync:addToMainMenu(menu_items)
             {
                 text = _("Sync now"),
                 callback = function()
-                    self:doSync(false)
+                    self:doSync()
                 end,
             },
             {
@@ -72,17 +74,12 @@ function WebDAVSync:addToMainMenu(menu_items)
             },
             {
                 text = _("Auto sync on startup"),
-                event = "AutoSyncOnStartup",
-                args = {true, false},
-                toggle = {_("enabled"), _("disabled")},
-                callback = function()
-                    local is_enabled = G_reader_settings:isTrue("webdav_autosync_enabled")
-                    local new_state = not is_enabled
-                    G_reader_settings:saveSetting("webdav_autosync_enabled", new_state)
-                end,
-                -- We still need a way to show current state if not using checked_func
                 checked_func = function()
-                     return G_reader_settings:isTrue("webdav_autosync_enabled")
+                    return G_reader_settings:isTrue("webdav_autosync_enabled")
+                end,
+                callback = function()
+                    local enabled = G_reader_settings:isTrue("webdav_autosync_enabled")
+                    G_reader_settings:saveSetting("webdav_autosync_enabled", not enabled)
                 end,
             },
         },
@@ -90,7 +87,7 @@ function WebDAVSync:addToMainMenu(menu_items)
 end
 
 function WebDAVSync:onWebDAVSyncNow()
-    self:doSync(false)
+    self:doSync()
     return true
 end
 
@@ -228,8 +225,7 @@ function WebDAVSync:setFileExtensions()
     end
 end
 
-function WebDAVSync:doSync(is_auto, turn_off_wifi)
-    -- Check if WiFi is enabled
+function WebDAVSync:doSync(turn_off_wifi)
     local NetworkMgr = require("ui/network/manager")
     if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
         UIManager:show(ConfirmBox:new{
@@ -237,15 +233,15 @@ function WebDAVSync:doSync(is_auto, turn_off_wifi)
             ok_text = _("Turn on WiFi"),
             ok_callback = function()
                 NetworkMgr:turnOnWifi(function()
-                    -- After WiFi is turned on, proceed with sync
-                    -- Pass true to indicate we should turn it off later
-                    self:doSync(is_auto, true)
+                    -- Pass true so we turn WiFi back off after sync.
+                    self:doSync(true)
                 end)
             end,
         })
         return
     end
-    
+
+
     local server_url = self:getSetting("server_url", "")
     if type(server_url) == "string" then
         server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
@@ -294,11 +290,8 @@ function WebDAVSync:doSync(is_auto, turn_off_wifi)
         end
         UIManager:show(InfoMessage:new{ text = msg })
     end
-    if turn_off_wifi then
-        local NetworkMgr = require("ui/network/manager")
-        if NetworkMgr and NetworkMgr.turnOffWifi then
-            NetworkMgr:turnOffWifi()
-        end
+    if turn_off_wifi and NetworkMgr.turnOffWifi then
+        NetworkMgr:turnOffWifi()
     end
 end
 
