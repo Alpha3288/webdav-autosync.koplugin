@@ -119,8 +119,25 @@ local function walk_local(folder, predicate)
     local lfs = load_lfs()
     local out = {}
     local function recurse(dir, prefix)
+        -- lfs.dir raises on permission errors and bad paths. Pre-v1.7.1 the
+        -- failure was silently swallowed, dropping the entire subtree from
+        -- the local index — and a missing local file with a cache row gets
+        -- classified as "skipped_local_gone" (no-deletion policy: don't
+        -- re-download), so a permission error halfway down the tree quietly
+        -- hid real local content from sync without any user-facing signal.
+        -- Differentiate two cases:
+        --   * directory simply doesn't exist (e.g. fresh install, no books
+        --     downloaded yet) — silent, this is normal.
+        --   * directory exists but is unreadable, or lfs.dir fails for any
+        --     other reason — warn, since real content is being hidden.
+        local attr = lfs.attributes(dir)
+        if not attr or attr.mode ~= "directory" then return end
         local ok, iter, state = pcall(lfs.dir, dir)
-        if not ok or not iter then return end
+        if not ok or not iter then
+            logger.warn("webdav_autosync: walk_local skip dir=" .. tostring(dir)
+                .. " err=" .. tostring(iter or "no iterator"))
+            return
+        end
         for entry in iter, state do
             if entry ~= "." and entry ~= ".." then
                 local full = dir .. "/" .. entry
