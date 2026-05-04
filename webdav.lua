@@ -363,8 +363,10 @@ local function download_file(remote_url, local_path, username, password)
     return true
 end
 
---- Create a WebDAV collection (directory). Returns true on 201 (created)
---- or 405 (already exists). Returns nil, error_message otherwise.
+--- Create a WebDAV collection (directory). Returns true on success (any 2xx
+--- — 201 Created is the spec response, but some servers reply 200 OK if the
+--- collection already exists), or 405 Method Not Allowed (RFC 4918's "already
+--- a collection here"). Returns nil, error_message otherwise.
 local function mkcol(remote_url, username, password)
     local url = url_encode(normalize_url(remote_url))
     if url:sub(-1) ~= "/" then url = url .. "/" end
@@ -384,7 +386,7 @@ local function mkcol(remote_url, username, password)
         socketutil:reset_timeout()
     end
     logger.dbg("webdav_autosync: MKCOL url=" .. url .. " status=" .. tostring(code))
-    if type(code) == "number" and (code == 201 or code == 405) then
+    if type(code) == "number" and ((code >= 200 and code < 300) or code == 405) then
         return true
     end
     return nil, "HTTP " .. tostring(code)
