@@ -8,9 +8,9 @@ Sync files from a WebDAV server to your device. Optional credentials, configurab
 - **Import from KOReader cloud storage** – If you already configured a WebDAV server under KOReader's built-in *Cloud storage* feature, pick it from KOReader's own picker (which also lets you choose a folder inside the server) and the URL and credentials are copied over automatically. The local download folder is always chosen separately.
 - **Download folder** – Opens KOReader’s file explorer; navigate and long-press a folder to select it (no typing paths).
 - **File extensions (optional)** – Sync only files with given extensions (e.g. `epub, pdf, txt`). Leave empty to sync all formats KOReader supports (EPUB, PDF, DjVu, XPS, CBT, CBZ, CB7, FB2, PDB, TXT, HTML, RTF, CHM, DOC, MOBI, ZIP, MD).
-- **Auto sync** – When enabled, sync runs at KOReader startup and on wake-from-sleep (debounced).
-- **Manual sync** – Use **Sync now** from the menu to pull all files at any time. The action is also exposed as `WebDAV sync now` in the Dispatcher, so you can bind it to a gesture, profile, or reader-top toolbar button.
-- **Two-way sync (optional)** – When enabled, also uploads new or changed local files back to the server. Uses a small state cache to detect what changed since the last sync, so re-runs only transfer files that actually moved. Conflicts (a file changed on both sides) surface as a per-file dialog at the next interactive moment (manual sync, startup, or wake) — silent triggers leave them pending. Deletions are never propagated.
+- **Auto-sync books** – When enabled, book sync runs at KOReader startup and on wake-from-sleep (debounced).
+- **Manual sync** – Use **Sync books now** from the menu to pull all files at any time. The action is also exposed as `WebDAV sync books now` in the Dispatcher, so you can bind it to a gesture, profile, or reader-top toolbar button.
+- **Two-way book sync (optional)** – When enabled, book sync also uploads new or changed local files back to the server. Affects book sync only — reading-progress sync is always bidirectional. Uses a small state cache to detect what changed since the last sync, so re-runs only transfer files that actually moved. Conflicts (a file changed on both sides) surface as a per-file dialog at the next interactive moment (manual sync, startup, or wake) — silent triggers leave them pending. Deletions are never propagated.
 - **Auto-sync reading progress (optional, opt-in)** – When enabled, the plugin keeps each book's `.sdr` sidecar (last reading position, bookmarks, highlights, custom metadata, custom cover) in sync across devices via the same WebDAV server. Triggered automatically on book close and device sleep (silent), and on wake and KOReader startup (interactive — any pending conflicts surface as a dialog). Also reachable manually via **Sync reading progress now** in the menu or the `WebDAV sync reading progress now` Dispatcher action (bind it to a gesture or toolbar slot). Requires KOReader's *Document → Metadata folder* to be set to *Book folder* (the default), since only that mode places sidecars next to books.
 
 ## Installation
@@ -26,11 +26,12 @@ Sync files from a WebDAV server to your device. Optional credentials, configurab
 3. **Set credentials (optional)** – Username and password if the server requires auth.
 4. **Choose download folder** – Opens the file browser; navigate to a folder and long-press it to select it as the download location.
 5. **Set file extensions (optional)** – Comma- or space-separated list (e.g. `epub, pdf, txt`). Leave empty to sync all KOReader-supported formats.
-6. **Auto sync on startup** – Turn on to sync automatically when KOReader starts and when the device wakes from sleep.
-7. **Two-way sync (upload local changes)** – Turn on to also push local changes back to the server. The very first run after enabling silently establishes a baseline of files already present on both sides (no transfers, no conflicts). Subsequent runs upload anything new or modified locally and download anything new or modified remotely.
+6. **Auto-sync books** – Turn on to sync book files automatically when KOReader starts and when the device wakes from sleep.
+7. **Two-way book sync (upload local changes)** – Turn on to also push local changes back to the server. The very first run after enabling silently establishes a baseline of files already present on both sides (no transfers, no conflicts). Subsequent runs upload anything new or modified locally and download anything new or modified remotely. Applies only to book sync — progress sync is always bidirectional.
 8. **Auto-sync reading progress** – Turn on to keep `.sdr` sidecars in sync across devices automatically. Pushes happen on book close and device sleep; pulls and conflict prompts happen on wake and at startup.
-9. **Sync now** – Run a full book-file sync manually (lists all files on the server, downloads matching ones into the chosen folder; with two-way on, also uploads local changes).
+9. **Sync books now** – Run a full book-file sync manually (lists all files on the server, downloads matching ones into the chosen folder; with two-way on, also uploads local changes).
 10. **Sync reading progress now** – Reconcile `.sdr` sidecars on demand without waiting for an event trigger.
+11. **Help** – Open an in-app reference of what each menu item does and how to set it up.
 
 Sync downloads **all files** under the server URL recursively; subfolders are recreated under the download folder.
 

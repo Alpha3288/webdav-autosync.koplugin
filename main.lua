@@ -9,6 +9,7 @@ local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local ConfirmBox = require("ui/widget/confirmbox")
 local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
+local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
@@ -42,7 +43,7 @@ function WebDAVSync:init()
     Dispatcher:registerAction("webdav_sync_now", {
         category = "none",
         event = "WebDAVSyncNow",
-        title = _("WebDAV sync now"),
+        title = _("WebDAV sync books now"),
         general = true,
     })
     Dispatcher:registerAction("webdav_progress_sync_now", {
@@ -72,7 +73,7 @@ function WebDAVSync:addToMainMenu(menu_items)
         sorting_hint = "tools",
         sub_item_table = {
             {
-                text = _("Sync now"),
+                text = _("Sync books now"),
                 callback = function()
                     self:doSync()
                 end,
@@ -112,35 +113,42 @@ function WebDAVSync:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Auto sync on startup"),
+                text = _("Auto-sync books"),
                 checked_func = function()
-                    return G_reader_settings:isTrue("webdav_autosync_enabled")
+                    return G_reader_settings:isTrue("webdav_autosync_books_auto")
                 end,
                 callback = function()
-                    local enabled = G_reader_settings:isTrue("webdav_autosync_enabled")
-                    G_reader_settings:saveSetting("webdav_autosync_enabled", not enabled)
+                    G_reader_settings:flipNilOrFalse("webdav_autosync_books_auto")
                 end,
+                help_text = _("When enabled, runs book sync automatically at KOReader startup and after the device wakes from sleep. File-manager only, debounced to once per 60 seconds."),
             },
             {
-                text = _("Two-way sync (upload local changes)"),
+                text = _("Two-way book sync (upload local changes)"),
                 checked_func = function()
-                    return G_reader_settings:isTrue("webdav_autosync_two_way")
+                    return G_reader_settings:isTrue("webdav_autosync_books_two_way")
                 end,
                 callback = function()
-                    local enabled = G_reader_settings:isTrue("webdav_autosync_two_way")
-                    G_reader_settings:saveSetting("webdav_autosync_two_way", not enabled)
+                    G_reader_settings:flipNilOrFalse("webdav_autosync_books_two_way")
                 end,
+                help_text = _("Affects book sync only. Off: download-only. On: also upload local additions and changes; conflicts (a file changed on both sides) prompt per file."),
             },
             {
                 text = _("Auto-sync reading progress"),
                 keep_menu_open = true,
                 checked_func = function()
-                    return G_reader_settings:isTrue("webdav_autosync_progress")
+                    return G_reader_settings:isTrue("webdav_autosync_progress_auto")
                 end,
                 callback = function()
-                    G_reader_settings:flipNilOrFalse("webdav_autosync_progress")
+                    G_reader_settings:flipNilOrFalse("webdav_autosync_progress_auto")
                 end,
                 help_text = _("When enabled, syncs .sdr sidecars (reading position, bookmarks, highlights) on book close, device sleep, wake, and KOReader startup. Conflicts are deferred to the next wake or startup. Off by default."),
+            },
+            {
+                text = _("Help"),
+                keep_menu_open = true,
+                callback = function()
+                    self:showHelp()
+                end,
             },
         },
     }
@@ -428,7 +436,7 @@ function WebDAVSync:doSync(opts)
         return
     end
 
-    local two_way = G_reader_settings and G_reader_settings:isTrue("webdav_autosync_two_way")
+    local two_way = G_reader_settings and G_reader_settings:isTrue("webdav_autosync_books_two_way")
     local ctx = {
         server_url = server_url,
         username = username,
@@ -612,7 +620,7 @@ end
 --- File-manager-only — a full library scan inside a reader context would
 --- be disruptive.
 function WebDAVSync:maybeRunBookAutoSync()
-    if not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_enabled")) then
+    if not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_books_auto")) then
         return
     end
     if self.ui.document then return end
@@ -647,7 +655,7 @@ function WebDAVSync:doProgressSync(opts)
     local on_done = opts.on_done
     local function done() if on_done then on_done() end end
 
-    if not manual and not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_progress")) then
+    if not manual and not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_progress_auto")) then
         return done()
     end
 
@@ -800,6 +808,61 @@ function WebDAVSync:runProgressSync(opts)
     end
 
     self:resolveConflictsInteractive(plan_obj, conflicts, stats, finish)
+end
+
+function WebDAVSync:showHelp()
+    local text = _([[
+WebDAV Sync syncs files (and optionally per-book reading progress) between your KOReader device and a WebDAV server.
+
+WHAT EACH MENU ITEM DOES
+
+• Sync books now
+  Run a one-shot book-file sync. Downloads matching files from the server. With "Two-way book sync" on, also uploads local additions and changes; conflicts pop a per-file dialog.
+
+• Sync reading progress now
+  Run a one-shot reconcile of every .sdr sidecar (reading position, bookmarks, highlights, custom metadata, custom cover). Conflicts pop a per-file dialog.
+
+• WebDAV server
+  Set the server URL, username, and password. Shared by book and progress sync.
+
+• Import from KOReader cloud storage
+  Copy a server you already configured under KOReader's built-in Cloud storage feature.
+
+• Choose download folder
+  Where book files (and their .sdr sidecars) live locally.
+
+• Set file extensions (optional)
+  Comma- or space-separated list (e.g. epub, pdf, txt). Empty = all KOReader-supported formats. Applies to book sync only; progress sync ignores this setting.
+
+• Auto-sync books
+  Run book sync automatically at KOReader startup and after the device wakes from sleep. File-manager context only, debounced to once per 60 seconds.
+
+• Two-way book sync (upload local changes)
+  Affects book sync only. Off: download-only. On: also upload local additions and changes, and prompt on conflicts.
+
+• Auto-sync reading progress
+  Run progress sync automatically on book close (silent), device sleep (silent), wake (interactive), and KOReader startup (interactive). Silent triggers leave conflicts untouched and held for the next interactive trigger.
+
+HOW TO SET IT UP
+
+1. Open "WebDAV server" and enter the URL plus optional credentials. Or tap "Import from KOReader cloud storage" to copy them from a server you already have configured.
+2. Tap "Choose download folder" and long-press the folder where you want books stored.
+3. (Optional) Tap "Set file extensions" if you only want certain formats.
+4. Tap "Sync books now" to do an initial download.
+5. Toggle "Auto-sync books" on if you want startup/wake auto-runs.
+6. Toggle "Two-way book sync" on if you also want local additions to upload.
+7. Toggle "Auto-sync reading progress" on if you want reading state to round-trip across devices.
+
+NOTES
+
+• Reading-progress sync requires KOReader's "Document → Metadata folder" setting to stay at "Book folder" (the default). Other modes place .sdr directories outside the synced library tree and the plugin can't map them to a remote path.
+• Book sync and progress sync share the same WebDAV server, credentials, and download folder, but can be enabled independently.
+• Conflicts are always resolved by the user — the plugin never picks a winner automatically.
+• Auto triggers silently no-op when offline; manual triggers prompt to enable Wi-Fi if needed.]])
+    UIManager:show(TextViewer:new{
+        title = _("WebDAV Sync — help"),
+        text = text,
+    })
 end
 
 function WebDAVSync:showProgressSummary(stats)
