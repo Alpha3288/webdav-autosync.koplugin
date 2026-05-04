@@ -23,6 +23,7 @@ sidecar relpaths share the same table; their key spaces never collide.
 local LuaSettings = require("luasettings")
 local DataStorage = require("datastorage")
 local logger = require("logger")
+local util = require("util")
 local webdav = require("webdav")
 
 
@@ -89,9 +90,11 @@ local function rel_from_remote_path(path, base)
 end
 
 --- Recursively collect local files under `folder`. Returns table keyed by
---- relpath -> { path = absolute, mtime = number, size = number }. The
---- predicate decides which entries to keep; it receives (entry_name, relpath).
-local function walk_local(folder, predicate)
+--- relpath -> { path = absolute, mtime = number, size = number, hash = string? }.
+--- The predicate decides which entries to keep; it receives (entry_name, relpath).
+--- When `compute_hash` is true, also fingerprints the file content via
+--- `util.partialMD5` (cheap for tiny sidecars; never call this for large books).
+local function walk_local(folder, predicate, compute_hash)
     local lfs = load_lfs()
     local out = {}
     local function recurse(dir, prefix)
@@ -111,6 +114,9 @@ local function walk_local(folder, predicate)
                             mtime = attr.modification,
                             size = attr.size,
                         }
+                        if compute_hash then
+                            out[rel].hash = util.partialMD5(full)
+                        end
                     end
                 end
             end
@@ -144,9 +150,11 @@ local function is_syncable_sidecar(rel)
 end
 
 --- Collect every regular file inside any `*.sdr/` directory under `folder`,
---- minus `.old` backup files.
+--- minus `.old` backup files. Sidecars are content-hashed because KOReader
+--- can rewrite them verbatim during normal operation (mtime advances, bytes
+--- unchanged) — only the hash distinguishes a real edit from a no-op rewrite.
 local function walk_local_sidecars(folder)
-    return walk_local(folder, function(_, rel) return is_syncable_sidecar(rel) end)
+    return walk_local(folder, function(_, rel) return is_syncable_sidecar(rel) end, true)
 end
 
 local function open_cache()
@@ -181,17 +189,21 @@ local function remote_changed(remote, cached)
 end
 
 --- True when local-side fingerprints differ from cache entry.
---- Size mismatch is decisive (file content always changes size, even by one
---- byte, when sidecar payload changes meaningfully). Mtime tolerates up to a
---- 2-second drift to absorb filesystems with coarse timestamp granularity
---- (vfat/exFAT store mtimes with 2-second resolution; some Kindle storage
---- partitions are vfat). Without this tolerance, the post-write stat may
---- record a value that the next stat reports differently after the FS rounds
---- it on flush, marking every unmodified sidecar as locally-changed and
---- triggering a redundant re-upload on every sync.
+--- Size mismatch is decisive. When both sides carry a content hash (sidecars
+--- always do; book files never do — too large to hash on every walk) the
+--- hash is the trusted signal and mtime is ignored, because KOReader can
+--- rewrite a sidecar verbatim during normal operation (coverbrowser metadata
+--- refresh, auto-save flush after self-healing `doc_path`, etc.) and an
+--- mtime-based check would treat the no-op rewrite as a real change. When
+--- no hash is available we fall back to a 2-second mtime tolerance to absorb
+--- filesystems with coarse timestamp granularity (vfat/exFAT, used on the
+--- Kindle user-storage partition).
 local function local_changed(loc, cached)
     if not cached then return true end
     if loc.size ~= cached.local_size then return true end
+    if cached.local_hash and loc.hash then
+        return cached.local_hash ~= loc.hash
+    end
     if math.abs((loc.mtime or 0) - (cached.local_mtime or 0)) >= 2 then return true end
     return false
 end
@@ -208,16 +220,24 @@ local function update_cache_entry(cache_files, rel, remote, loc, etag_override)
         remote_mtime = remote and remote.mtime or nil,
         local_mtime = loc and loc.mtime or nil,
         local_size = loc and loc.size or nil,
+        local_hash = loc and loc.hash or nil,
     }
 end
 
 --- Restat a local file after a successful download or upload so the cache
---- reflects what's actually on disk now.
+--- reflects what's actually on disk now. For sidecar paths the content hash
+--- is also captured; without it the next sync's `local_changed` check would
+--- have to fall back to mtime and could re-flag a verbatim rewrite as a
+--- spurious change.
 local function stat_local(path)
     local lfs = load_lfs()
     local attr = lfs.attributes(path)
     if not attr or attr.mode ~= "file" then return nil end
-    return { path = path, mtime = attr.modification, size = attr.size }
+    local result = { path = path, mtime = attr.modification, size = attr.size }
+    if is_sidecar_path(path) then
+        result.hash = util.partialMD5(path)
+    end
+    return result
 end
 
 --- Run a one-way sync (legacy behaviour). Lists remote, downloads anything
@@ -529,7 +549,7 @@ local function plan_progress_book(server_url, username, password, local_folder, 
     -- be relative to local_folder so cache keys match what
     -- plan_progress (full walk) writes.
     local local_index = {}
-    local sub_files = walk_local(local_folder .. "/" .. sdr_rel, function() return true end)
+    local sub_files = walk_local(local_folder .. "/" .. sdr_rel, function() return true end, true)
     for sub_rel, info in pairs(sub_files) do
         local full_rel = sdr_rel .. "/" .. sub_rel
         if is_syncable_sidecar(full_rel) then
