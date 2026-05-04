@@ -39,8 +39,21 @@ local function url_has_host(url)
     return host and host ~= ""
 end
 
---- PROPFIND body: use empty/minimal like KOReader WebDavApi (some servers expect it).
-local PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><allprop/></propfind>'
+--- PROPFIND body. Mirrors KOReader's apps/cloudstorage/webdavapi.lua at
+--- v2026.03 (prefixed namespace, explicit <prop> list rather than <allprop/>),
+--- extended with getetag and getlastmodified because two-way sync needs them
+--- for change detection. Koofr — and other strict servers like some
+--- ownCloud builds — return 400 Bad Request on <allprop/>, so the explicit
+--- list isn't optional.
+local PROPFIND_BODY = '<?xml version="1.0"?>' ..
+    '<a:propfind xmlns:a="DAV:">' ..
+        '<a:prop>' ..
+            '<a:resourcetype/>' ..
+            '<a:getcontentlength/>' ..
+            '<a:getetag/>' ..
+            '<a:getlastmodified/>' ..
+        '</a:prop>' ..
+    '</a:propfind>'
 
 local MONTHS = {
     Jan=1, Feb=2, Mar=3, Apr=4, May=5, Jun=6,
