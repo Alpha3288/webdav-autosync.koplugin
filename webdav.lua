@@ -76,14 +76,23 @@ local function parse_http_date(s)
     return nil
 end
 
---- Parse PROPFIND XML response into list of { href, is_collection, path, etag, mtime }.
---- Accept any namespace prefix like WebDavApi (<*:response>, <*:href>, etc.).
+--- Parse PROPFIND XML response into list of { href, href_raw, is_collection,
+--- path, etag, mtime }. Accept any namespace prefix like WebDavApi
+--- (<*:response>, <*:href>, etc.).
+---
+--- `href_raw` is the wire-format href as the server returned it (percent-encoded);
+--- `href` and `path` are the percent-DECODED forms used for filename matching
+--- and local-path comparisons. Any code that issues a follow-up HTTP request
+--- (e.g. PROPFIND on a child collection during recursion) MUST use `href_raw`,
+--- since handing a decoded URL with literal spaces or other reserved chars
+--- to socket.http produces a malformed request line that strict servers
+--- (Koofr's HTTP frontend, for instance) reject with 400 Bad Request.
 local function parse_propfind_response(body)
     local list = {}
     for block in (body or ""):gmatch("<[^:]*:response[^>]*>.-</[^:]*:response>") do
-        local href = block:match("<[^:]*:href[^>]*>([^<]+)</[^:]*:href>")
-        if href then
-            href = href:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
+        local href_raw = block:match("<[^:]*:href[^>]*>([^<]+)</[^:]*:href>")
+        if href_raw then
+            local href = href_raw:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
             local is_collection = not not block:match("<[^:]*:collection[^/]*/>")
             -- Normalize: remove server base and leading slashes for path
             local path = href
@@ -100,6 +109,7 @@ local function parse_propfind_response(body)
             local mtime = parse_http_date(lastmod)
             table.insert(list, {
                 href = href,
+                href_raw = href_raw,
                 is_collection = is_collection,
                 path = path,
                 etag = etag,
@@ -190,7 +200,11 @@ local function get_props(url, username, password)
 end
 
 --- Recursively collect all file URLs under base_url (directories traversed).
---- Returns flat list of { href, is_collection, path } for all resources.
+--- Returns flat list of { href, href_raw, is_collection, path, href_full }
+--- for all resources. `href_full` is the absolute decoded URL (compatible with
+--- existing download_file/upload_file consumers, which re-encode via url_encode);
+--- the recursion itself uses the raw (encoded) form as the request URL so
+--- strict servers don't 400 on paths containing spaces or other reserved chars.
 local function list_all(base_url, username, password)
     base_url = normalize_url(base_url)
     local base_domain = base_url:match("^(https?://[^/]+)")
@@ -200,19 +214,28 @@ local function list_all(base_url, username, password)
         if not list then
             return nil, code, err
         end
+        -- Self-skip key: e.path is decoded, so decode the request URL's path
+        -- the same way before comparing. Otherwise a recursive call (whose
+        -- url is encoded) would never match its own decoded e.path entry,
+        -- the parent would re-list itself, and infinite recursion would only
+        -- be averted by an eventual server error.
+        local url_path = url:gsub("^https?://[^/]+", ""):gsub("^/+", ""):gsub("/+$", "")
+        url_path = url_path:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
         for _, e in ipairs(list) do
             local href_full = e.href
             if not href_full:match("^https?://") and base_domain then
                 href_full = base_domain .. (href_full:gsub("^/+", "/"))
             end
-            -- Skip the requested URL itself
-            local url_path = url:gsub("^https?://[^/]+", ""):gsub("^/+", ""):gsub("/+$", "")
+            local href_request = e.href_raw or e.href
+            if not href_request:match("^https?://") and base_domain then
+                href_request = base_domain .. (href_request:gsub("^/+", "/"))
+            end
             local e_path_norm = (e.path or ""):gsub("^/+", ""):gsub("/+$", "")
             if e_path_norm ~= url_path and e_path_norm ~= "" then
                 e.href_full = href_full
                 table.insert(all, e)
                 if e.is_collection then
-                    local ok, c, m = recurse(href_full)
+                    local ok, c, m = recurse(href_request)
                     if not ok then return nil, c, m end
                 end
             end
