@@ -215,15 +215,70 @@ local function get_props(url, username, password)
     return list[1]
 end
 
---- Recursively collect all file URLs under base_url (directories traversed).
---- Returns flat list of { href, href_raw, is_collection, path, href_full }
---- for all resources. `href_full` is the absolute decoded URL (compatible with
---- existing download_file/upload_file consumers, which re-encode via url_encode);
---- the recursion itself uses the raw (encoded) form as the request URL so
---- strict servers don't 400 on paths containing spaces or other reserved chars.
+--- Hosts that returned a hard refusal to PROPFIND Depth: infinity (4xx/5xx)
+--- during this KOReader process. Subsequent list_all calls for those hosts
+--- skip straight to the recursive Depth: 1 fallback so we don't pay a failed
+--- request per sync. Keyed by `https://host[:port]` so multi-server users
+--- don't lose the fast path on a permissive server because a strict one
+--- refused once. Cleared at process restart, which is fine: server config
+--- changes are rare, and a stale memo only costs the recursive walk we'd
+--- have done anyway pre-v1.7.0.
+local infinity_unsupported = {}
+
+--- Collect all file URLs under base_url. Returns flat list of
+--- { href, href_raw, is_collection, path, href_full } for all resources.
+--- `href_full` is the absolute decoded URL (compatible with existing
+--- download_file/upload_file consumers, which re-encode via url_encode).
+---
+--- Fast path: one PROPFIND with `Depth: infinity` returns the entire
+--- subtree in a single round trip. On a library with N book directories
+--- and N sidecar directories that's 1 request instead of ~2N+1, dominating
+--- planning time on Resume / startup. Falls back to the legacy recursive
+--- Depth: 1 walk when the server refuses (some hosted providers return
+--- 403, 507 Insufficient Storage, or 501 Not Implemented; we don't try
+--- to enumerate them — any 4xx/5xx triggers fallback and is memoed).
+--- The recursion itself uses the raw (percent-encoded) form as the request
+--- URL so strict servers don't 400 on paths containing spaces or other
+--- reserved chars.
 local function list_all(base_url, username, password)
     base_url = normalize_url(base_url)
-    local base_domain = base_url:match("^(https?://[^/]+)")
+    local base_domain = base_url:match("^(https?://[^/]+)") or ""
+
+    if base_domain ~= "" and not infinity_unsupported[base_domain] then
+        local list, code, err = list_one(base_url, username, password, "infinity")
+        if list then
+            -- Same self-skip key derivation as the recursive path: the
+            -- request URL's own entry must not be re-emitted as a child.
+            local req_path = base_url:gsub("^https?://[^/]+", ""):gsub("^/+", ""):gsub("/+$", "")
+            req_path = req_path:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
+            local all = {}
+            for _, e in ipairs(list) do
+                local href_full = e.href
+                if not href_full:match("^https?://") then
+                    href_full = base_domain .. (href_full:gsub("^/+", "/"))
+                end
+                local e_path_norm = (e.path or ""):gsub("^/+", ""):gsub("/+$", "")
+                if e_path_norm ~= req_path and e_path_norm ~= "" then
+                    e.href_full = href_full
+                    table.insert(all, e)
+                end
+            end
+            logger.dbg("webdav_autosync: list_all depth=infinity entries=" .. tostring(#all))
+            return all
+        end
+        if type(code) == "number" and code >= 400 and code < 600 then
+            logger.info("webdav_autosync: list_all depth=infinity refused status=" .. tostring(code)
+                .. " host=" .. base_domain .. " — falling back to recursive Depth: 1")
+            infinity_unsupported[base_domain] = true
+        else
+            -- Non-HTTP failure (timeout, DNS, auth string from socket layer).
+            -- Don't memo — the recursive fallback will likely hit the same
+            -- error and surface it to the caller. Pre-v1.7.0 behavior.
+            logger.dbg("webdav_autosync: list_all depth=infinity error code=" .. tostring(code)
+                .. " err=" .. tostring(err) .. " — trying recursive")
+        end
+    end
+
     local all = {}
     local function recurse(url)
         local list, code, err = list_one(url, username, password, "1")
@@ -239,11 +294,11 @@ local function list_all(base_url, username, password)
         url_path = url_path:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
         for _, e in ipairs(list) do
             local href_full = e.href
-            if not href_full:match("^https?://") and base_domain then
+            if not href_full:match("^https?://") and base_domain ~= "" then
                 href_full = base_domain .. (href_full:gsub("^/+", "/"))
             end
             local href_request = e.href_raw or e.href
-            if not href_request:match("^https?://") and base_domain then
+            if not href_request:match("^https?://") and base_domain ~= "" then
                 href_request = base_domain .. (href_request:gsub("^/+", "/"))
             end
             local e_path_norm = (e.path or ""):gsub("^/+", ""):gsub("/+$", "")
