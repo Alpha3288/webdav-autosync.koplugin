@@ -1,1 +1,9 @@
-.git
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+*.bak
+
+# OS junk
+.DS_Store
+Thumbs.db
