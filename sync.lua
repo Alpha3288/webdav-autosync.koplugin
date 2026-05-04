@@ -22,6 +22,7 @@ sidecar relpaths share the same table; their key spaces never collide.
 
 local LuaSettings = require("luasettings")
 local DataStorage = require("datastorage")
+local logger = require("logger")
 local webdav = require("webdav")
 
 
@@ -180,10 +181,18 @@ local function remote_changed(remote, cached)
 end
 
 --- True when local-side fingerprints differ from cache entry.
+--- Size mismatch is decisive (file content always changes size, even by one
+--- byte, when sidecar payload changes meaningfully). Mtime tolerates up to a
+--- 2-second drift to absorb filesystems with coarse timestamp granularity
+--- (vfat/exFAT store mtimes with 2-second resolution; some Kindle storage
+--- partitions are vfat). Without this tolerance, the post-write stat may
+--- record a value that the next stat reports differently after the FS rounds
+--- it on flush, marking every unmodified sidecar as locally-changed and
+--- triggering a redundant re-upload on every sync.
 local function local_changed(loc, cached)
     if not cached then return true end
-    if loc.mtime ~= cached.local_mtime then return true end
     if loc.size ~= cached.local_size then return true end
+    if math.abs((loc.mtime or 0) - (cached.local_mtime or 0)) >= 2 then return true end
     return false
 end
 
@@ -345,6 +354,13 @@ local function diff_indices(remote_index, local_index, cache_files, server_url, 
             else
                 local rc = remote_changed(r, c)
                 local lc = local_changed(l, c)
+                if lc then
+                    logger.dbg(string.format(
+                        "webdav_autosync: local-changed rel=%s mtime cached=%s now=%s size cached=%s now=%s",
+                        rel,
+                        tostring(c.local_mtime), tostring(l.mtime),
+                        tostring(c.local_size), tostring(l.size)))
+                end
                 if rc and lc then
                     table.insert(actions.conflicts, {
                         rel = rel,
