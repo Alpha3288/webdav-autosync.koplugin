@@ -42,7 +42,28 @@ end
 --- PROPFIND body: use empty/minimal like KOReader WebDavApi (some servers expect it).
 local PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><allprop/></propfind>'
 
---- Parse PROPFIND XML response into list of { href, is_collection, path }.
+local MONTHS = {
+    Jan=1, Feb=2, Mar=3, Apr=4, May=5, Jun=6,
+    Jul=7, Aug=8, Sep=9, Oct=10, Nov=11, Dec=12,
+}
+
+--- Parse RFC 1123 HTTP-date ("Wed, 31 Oct 2025 12:34:56 GMT") to epoch seconds.
+--- Result is in local-time epoch via os.time(); it's a stable comparison key, not a UTC value.
+local function parse_http_date(s)
+    if not s or type(s) ~= "string" then return nil end
+    local day, mon, year, hour, minute, sec = s:match("(%d+)%s+(%a+)%s+(%d+)%s+(%d+):(%d+):(%d+)")
+    if not day then return nil end
+    local m = MONTHS[mon]
+    if not m then return nil end
+    local ok, t = pcall(os.time, {
+        year = tonumber(year), month = m, day = tonumber(day),
+        hour = tonumber(hour), min = tonumber(minute), sec = tonumber(sec),
+    })
+    if ok then return t end
+    return nil
+end
+
+--- Parse PROPFIND XML response into list of { href, is_collection, path, etag, mtime }.
 --- Accept any namespace prefix like WebDavApi (<*:response>, <*:href>, etc.).
 local function parse_propfind_response(body)
     local list = {}
@@ -58,10 +79,18 @@ local function parse_propfind_response(body)
             end
             path = path:gsub("^/+", ""):gsub("/+$", "")
             if path == "" then path = "/" end
+            local etag = block:match("<[^:]*:getetag[^>]*>([^<]+)</[^:]*:getetag>")
+            if etag then
+                etag = etag:gsub('^%s*"', ''):gsub('"%s*$', '')
+            end
+            local lastmod = block:match("<[^:]*:getlastmodified[^>]*>([^<]+)</[^:]*:getlastmodified>")
+            local mtime = parse_http_date(lastmod)
             table.insert(list, {
                 href = href,
                 is_collection = is_collection,
                 path = path,
+                etag = etag,
+                mtime = mtime,
             })
         end
     end
@@ -106,6 +135,45 @@ local function list_one(url, username, password, depth)
         return nil, code or status, body_str or tostring(status)
     end
     return parse_propfind_response(body_str), code
+end
+
+--- Fetch a single resource's WebDAV properties (Depth: 0). Returns the first
+--- entry from parse_propfind_response, or nil, code/error.
+--- Used after a PUT upload to re-read the server's canonical etag/mtime so
+--- the cache matches what the next PROPFIND will return (avoids "I just
+--- uploaded but now mtime changed → redownload" loops on servers that don't
+--- echo a useful ETag from PUT).
+local function get_props(url, username, password)
+    url = normalize_url(url)
+    if not url_has_host(url) then
+        return nil, "host or service not provided, or not known"
+    end
+    local body = {}
+    local request = {
+        url = url,
+        method = "PROPFIND",
+        headers = {
+            ["Content-Type"] = "application/xml",
+            ["Depth"] = "0",
+            ["Content-Length"] = #PROPFIND_BODY,
+        },
+        source = ltn12.source.string(PROPFIND_BODY),
+        sink = ltn12.sink.table(body),
+        user = (username and username ~= "") and username or nil,
+        password = (password and password ~= "") and password or nil,
+    }
+    if socketutil and socketutil.set_timeout then
+        socketutil:set_timeout()
+    end
+    local code, _, status = socket.skip(1, http.request(request))
+    if socketutil and socketutil.reset_timeout then
+        socketutil:reset_timeout()
+    end
+    if type(code) ~= "number" or code < 200 or code > 299 then
+        return nil, code or status
+    end
+    local list = parse_propfind_response(table.concat(body))
+    return list[1]
 end
 
 --- Recursively collect all file URLs under base_url (directories traversed).
@@ -188,10 +256,106 @@ local function download_file(remote_url, local_path, username, password)
     return true
 end
 
+--- Create a WebDAV collection (directory). Returns true on 201 (created)
+--- or 405 (already exists). Returns nil, error_message otherwise.
+local function mkcol(remote_url, username, password)
+    local url = url_encode(normalize_url(remote_url))
+    if url:sub(-1) ~= "/" then url = url .. "/" end
+    local body = {}
+    local request = {
+        url = url,
+        method = "MKCOL",
+        sink = ltn12.sink.table(body),
+        user = (username and username ~= "") and username or nil,
+        password = (password and password ~= "") and password or nil,
+    }
+    if socketutil and socketutil.set_timeout then
+        socketutil:set_timeout()
+    end
+    local code = socket.skip(1, http.request(request))
+    if socketutil and socketutil.reset_timeout then
+        socketutil:reset_timeout()
+    end
+    if type(code) == "number" and (code == 201 or code == 405) then
+        return true
+    end
+    return nil, "HTTP " .. tostring(code)
+end
+
+--- Ensure every parent collection of `rel_path` exists under `server_url`.
+--- Idempotent: existing collections (HTTP 405) are treated as success.
+--- Returns true on success, or nil, error_message.
+local function ensure_remote_dirs(server_url, rel_path, username, password)
+    if not rel_path or rel_path == "" then return true end
+    local parts = {}
+    for segment in rel_path:gmatch("[^/]+") do
+        table.insert(parts, segment)
+    end
+    if #parts < 2 then return true end -- no subdirectories to create
+    local base = normalize_url(server_url):gsub("/+$", "")
+    local accum = base
+    for i = 1, #parts - 1 do
+        accum = accum .. "/" .. parts[i]
+        local ok, err = mkcol(accum, username, password)
+        if not ok then return nil, err end
+    end
+    return true
+end
+
+--- Upload a local file to WebDAV via PUT. Returns true, etag_or_nil on success,
+--- or nil, error_message on failure. Creates parent collections as needed.
+local function upload_file(remote_url, local_path, username, password)
+    -- Resolve local path same way download_file does.
+    local lpath = local_path
+    if not lpath:match("^/") then
+        local ok_ds, DataStorage = pcall(require, "datastorage")
+        if ok_ds and DataStorage and DataStorage.getRealPath then
+            lpath = DataStorage:getRealPath(local_path)
+        end
+    end
+    local f, ferr = io.open(lpath, "rb")
+    if not f then return nil, ferr end
+    local size = f:seek("end") or 0
+    f:seek("set", 0)
+
+    local url = url_encode(normalize_url(remote_url))
+    local response_body = {}
+    local request = {
+        url = url,
+        method = "PUT",
+        headers = {
+            ["Content-Length"] = tostring(size),
+            ["Content-Type"] = "application/octet-stream",
+        },
+        source = ltn12.source.file(f),
+        sink = ltn12.sink.table(response_body),
+        user = (username and username ~= "") and username or nil,
+        password = (password and password ~= "") and password or nil,
+    }
+    if socketutil and socketutil.set_timeout then
+        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    end
+    local _, code, headers = http.request(request)
+    if socketutil and socketutil.reset_timeout then
+        socketutil:reset_timeout()
+    end
+    if type(code) ~= "number" or code < 200 or code > 299 then
+        return nil, "HTTP " .. tostring(code)
+    end
+    local etag = headers and (headers.etag or headers.ETag)
+    if etag then etag = etag:gsub('^%s*"', ''):gsub('"%s*$', '') end
+    return true, etag
+end
+
 return {
     normalize_url = normalize_url,
     url_has_host = url_has_host,
     list_one = list_one,
     list_all = list_all,
     download_file = download_file,
+    upload_file = upload_file,
+    mkcol = mkcol,
+    ensure_remote_dirs = ensure_remote_dirs,
+    get_props = get_props,
+    parse_http_date = parse_http_date,
 }

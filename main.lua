@@ -8,6 +8,7 @@ and auto-download or manually pull all files.
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local ConfirmBox = require("ui/widget/confirmbox")
+local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
@@ -36,7 +37,7 @@ function WebDAVSync:init()
             and not self.ui.document and not auto_sync_started then
         auto_sync_started = true
         UIManager:scheduleIn(2, function()
-            self:doSync()
+            self:doSync({ is_auto = true })
         end)
     end
 end
@@ -87,6 +88,16 @@ function WebDAVSync:addToMainMenu(menu_items)
                 callback = function()
                     local enabled = G_reader_settings:isTrue("webdav_autosync_enabled")
                     G_reader_settings:saveSetting("webdav_autosync_enabled", not enabled)
+                end,
+            },
+            {
+                text = _("Two-way sync (upload local changes)"),
+                checked_func = function()
+                    return G_reader_settings:isTrue("webdav_autosync_two_way")
+                end,
+                callback = function()
+                    local enabled = G_reader_settings:isTrue("webdav_autosync_two_way")
+                    G_reader_settings:saveSetting("webdav_autosync_two_way", not enabled)
                 end,
             },
         },
@@ -276,7 +287,11 @@ function WebDAVSync:setFileExtensions()
     end
 end
 
-function WebDAVSync:doSync(turn_off_wifi)
+function WebDAVSync:doSync(opts)
+    opts = opts or {}
+    local is_auto = opts.is_auto
+    local turn_off_wifi = opts.turn_off_wifi
+
     local NetworkMgr = require("ui/network/manager")
     if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
         UIManager:show(ConfirmBox:new{
@@ -284,14 +299,12 @@ function WebDAVSync:doSync(turn_off_wifi)
             ok_text = _("Turn on WiFi"),
             ok_callback = function()
                 NetworkMgr:turnOnWifi(function()
-                    -- Pass true so we turn WiFi back off after sync.
-                    self:doSync(true)
+                    self:doSync({ is_auto = is_auto, turn_off_wifi = true })
                 end)
             end,
         })
         return
     end
-
 
     local server_url = self:getSetting("server_url", "")
     if type(server_url) == "string" then
@@ -323,13 +336,31 @@ function WebDAVSync:doSync(turn_off_wifi)
         })
         return
     end
+
+    local two_way = G_reader_settings and G_reader_settings:isTrue("webdav_autosync_two_way")
+    local ctx = {
+        server_url = server_url,
+        username = username,
+        password = password,
+        folder = folder,
+        file_extensions = file_extensions,
+        is_auto = is_auto,
+        turn_off_wifi = turn_off_wifi,
+    }
+    if two_way then
+        self:runTwoWaySync(ctx)
+    else
+        self:runOneWaySync(ctx)
+    end
+end
+
+function WebDAVSync:runOneWaySync(ctx)
     local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
     UIManager:show(syncing_msg)
     UIManager:forceRePaint()
-    local ok, skip, err = sync.run_sync(server_url, username, password, folder, nil, file_extensions)
-    if syncing_msg then
-        UIManager:close(syncing_msg)
-    end
+    local ok, skip, err = sync.run_sync(ctx.server_url, ctx.username, ctx.password,
+            ctx.folder, nil, ctx.file_extensions)
+    UIManager:close(syncing_msg)
     if err then
         UIManager:show(InfoMessage:new{
             text = T(_("Sync failed: %1"), tostring(err)),
@@ -341,7 +372,144 @@ function WebDAVSync:doSync(turn_off_wifi)
         end
         UIManager:show(InfoMessage:new{ text = msg })
     end
-    if turn_off_wifi and NetworkMgr.turnOffWifi then
+    self:turnOffWifiIfRequested(ctx)
+end
+
+function WebDAVSync:runTwoWaySync(ctx)
+    local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
+    UIManager:show(syncing_msg)
+    UIManager:forceRePaint()
+
+    local plan_obj, err = sync.plan(ctx.server_url, ctx.username, ctx.password,
+            ctx.folder, ctx.file_extensions)
+    if not plan_obj then
+        UIManager:close(syncing_msg)
+        UIManager:show(InfoMessage:new{
+            text = T(_("Sync failed: %1"), tostring(err)),
+        })
+        self:turnOffWifiIfRequested(ctx)
+        return
+    end
+
+    local stats = {
+        downloaded = 0,
+        uploaded = 0,
+        unchanged = plan_obj.actions.skipped_unchanged,
+        baselined = plan_obj.actions.baselined,
+        conflicts_skipped = 0,
+        failed = 0,
+        failures = {},
+    }
+
+    for _, a in ipairs(plan_obj.actions.to_download) do
+        local ok, msg = sync.do_action(plan_obj, "download", a)
+        if ok then
+            stats.downloaded = stats.downloaded + 1
+        else
+            stats.failed = stats.failed + 1
+            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
+        end
+    end
+    for _, a in ipairs(plan_obj.actions.to_upload) do
+        local ok, msg = sync.do_action(plan_obj, "upload", a)
+        if ok then
+            stats.uploaded = stats.uploaded + 1
+        else
+            stats.failed = stats.failed + 1
+            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
+        end
+    end
+
+    UIManager:close(syncing_msg)
+
+    local conflicts = plan_obj.actions.conflicts
+    local function finish()
+        sync.save_cache(plan_obj)
+        self:showTwoWaySummary(stats)
+        self:turnOffWifiIfRequested(ctx)
+    end
+
+    if #conflicts == 0 or ctx.is_auto then
+        if ctx.is_auto then
+            stats.conflicts_skipped = #conflicts
+        end
+        finish()
+        return
+    end
+
+    self:resolveConflictsInteractive(plan_obj, conflicts, stats, finish)
+end
+
+function WebDAVSync:resolveConflictsInteractive(plan_obj, conflicts, stats, on_done)
+    local idx = 1
+    local function next_one()
+        if idx > #conflicts then
+            on_done()
+            return
+        end
+        local c = conflicts[idx]
+        local dialog
+        local function pick(action)
+            UIManager:close(dialog)
+            idx = idx + 1
+            if action == "skip" then
+                stats.conflicts_skipped = stats.conflicts_skipped + 1
+                next_one()
+                return
+            end
+            local ok, msg = sync.do_action(plan_obj, action, c)
+            if ok then
+                if action == "download" then
+                    stats.downloaded = stats.downloaded + 1
+                else
+                    stats.uploaded = stats.uploaded + 1
+                end
+            else
+                stats.failed = stats.failed + 1
+                table.insert(stats.failures, c.rel .. " (" .. tostring(msg) .. ")")
+            end
+            next_one()
+        end
+        dialog = ButtonDialogTitle:new{
+            title = T(_("Conflict on %1\nBoth local and remote changed since last sync."), c.rel),
+            buttons = {
+                {{ text = _("Keep local (upload)"),     callback = function() pick("upload")   end }},
+                {{ text = _("Keep remote (download)"),  callback = function() pick("download") end }},
+                {{ text = _("Skip"),                    callback = function() pick("skip")     end }},
+            },
+        }
+        UIManager:show(dialog)
+    end
+    next_one()
+end
+
+function WebDAVSync:showTwoWaySummary(stats)
+    local parts = {}
+    table.insert(parts, T(_("%1 downloaded."), tostring(stats.downloaded)))
+    table.insert(parts, T(_("%1 uploaded."), tostring(stats.uploaded)))
+    if stats.unchanged > 0 then
+        table.insert(parts, T(_("%1 unchanged."), tostring(stats.unchanged)))
+    end
+    if stats.baselined > 0 then
+        table.insert(parts, T(_("%1 baselined."), tostring(stats.baselined)))
+    end
+    if stats.conflicts_skipped > 0 then
+        table.insert(parts, T(_("%1 conflicts skipped."), tostring(stats.conflicts_skipped)))
+    end
+    if stats.failed > 0 then
+        table.insert(parts, T(_("%1 failed."), tostring(stats.failed)))
+    end
+    local text = _("Sync done.") .. " " .. table.concat(parts, " ")
+    if stats.failed > 0 and #stats.failures > 0 then
+        text = text .. "\n\n" .. table.concat(stats.failures, "\n")
+    end
+    UIManager:show(InfoMessage:new{ text = text })
+end
+
+function WebDAVSync:turnOffWifiIfRequested(ctx)
+    if not ctx.turn_off_wifi then return end
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr.turnOffWifi then
         NetworkMgr:turnOffWifi()
     end
 end
