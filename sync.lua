@@ -130,8 +130,8 @@ local function walk_local(folder, predicate)
         --     downloaded yet) — silent, this is normal.
         --   * directory exists but is unreadable, or lfs.dir fails for any
         --     other reason — warn, since real content is being hidden.
-        local attr = lfs.attributes(dir)
-        if not attr or attr.mode ~= "directory" then return end
+        local dir_attr = lfs.attributes(dir)
+        if not dir_attr or dir_attr.mode ~= "directory" then return end
         local ok, iter, state = pcall(lfs.dir, dir)
         if not ok or not iter then
             logger.warn("webdav_autosync: walk_local skip dir=" .. tostring(dir)
