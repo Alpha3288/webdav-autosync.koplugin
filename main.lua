@@ -12,6 +12,7 @@ local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
 local TextViewer = require("ui/widget/textviewer")
 local SpinWidget = require("ui/widget/spinwidget")
 local UIManager = require("ui/uimanager")
+local Event = require("ui/event")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local logger = require("logger")
@@ -543,7 +544,7 @@ function WebDAVSync:runOneWaySync(ctx)
     local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
     UIManager:show(syncing_msg)
     UIManager:forceRePaint()
-    local ok, skip, err = sync.run_sync(ctx.server_url, ctx.username, ctx.password,
+    local ok, skip, err, downloaded_rels = sync.run_sync(ctx.server_url, ctx.username, ctx.password,
             ctx.folder, nil, ctx.file_extensions)
     UIManager:close(syncing_msg)
     if err then
@@ -557,6 +558,9 @@ function WebDAVSync:runOneWaySync(ctx)
         end
         UIManager:show(InfoMessage:new{ text = msg })
     end
+    -- Even on partial failure (err set + count_fail returned), files that
+    -- did get written should still trigger a refresh.
+    self:notifyLibraryRefresh(ctx.folder, downloaded_rels)
     self:turnOffWifiIfRequested(ctx)
 end
 
@@ -584,12 +588,14 @@ function WebDAVSync:runTwoWaySync(ctx)
         conflicts_skipped = 0,
         failed = 0,
         failures = {},
+        downloaded_rels = {},
     }
 
     for _, a in ipairs(plan_obj.actions.to_download) do
         local ok, msg = sync.do_action(plan_obj, "download", a)
         if ok then
             stats.downloaded = stats.downloaded + 1
+            table.insert(stats.downloaded_rels, a.rel)
         else
             stats.failed = stats.failed + 1
             table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
@@ -610,6 +616,7 @@ function WebDAVSync:runTwoWaySync(ctx)
     local conflicts = plan_obj.actions.conflicts
     local function finish()
         sync.save_cache(plan_obj)
+        self:notifyLibraryRefresh(plan_obj.local_folder, stats.downloaded_rels)
         self:showTwoWaySummary(stats)
         self:turnOffWifiIfRequested(ctx)
     end
@@ -643,6 +650,9 @@ function WebDAVSync:resolveConflictsInteractive(plan_obj, conflicts, stats, on_d
             if ok then
                 if action == "download" then
                     stats.downloaded = stats.downloaded + 1
+                    if stats.downloaded_rels then
+                        table.insert(stats.downloaded_rels, c.rel)
+                    end
                 else
                     stats.uploaded = stats.uploaded + 1
                 end
@@ -663,6 +673,51 @@ function WebDAVSync:resolveConflictsInteractive(plan_obj, conflicts, stats, on_d
         UIManager:show(dialog)
     end
     next_one()
+end
+
+--- Tell KOReader's file-browser / history / collections views to redraw after
+--- we replaced sidecar contents (or downloaded a new/changed book file) on
+--- disk. Without this the file manager keeps showing stale state — e.g. the
+--- old percent-finished / "reading" badge from before a progress sync pulled
+--- in newer reading state from another device.
+---
+--- Two events, in order:
+---   1. `InvalidateMetadataCache` per affected book — drops the SQLite-cached
+---      metadata row used by `coverbrowser.koplugin` so cover mosaic / list
+---      modes re-extract on next render.
+---   2. `BookMetadataChanged` (no arg) — handled by `FileManager` (re-walks the
+---      current dir and re-reads sidecars), `FileManagerHistory`, `Collection`,
+---      and `FileSearcher`. Reader-side handlers (`ReaderCoptListener`,
+---      `ReaderFooter`) gate on `prop_updated`, so passing nil makes them no-op
+---      — safe to broadcast even with a book open.
+---
+--- `downloaded_rels` mixes sidecar relpaths (`Books/Foo.sdr/metadata.epub.lua`)
+--- and book-file relpaths (`Books/Foo.epub`). Sidecar paths get mapped back to
+--- their book file via `<stem>.<ext>`; book paths are used as-is. Sidecar
+--- entries other than `metadata.<ext>.lua` (cover, custom_metadata) don't
+--- carry the book extension on their own — they fall through to just the
+--- global `BookMetadataChanged` and let the file manager re-walk.
+function WebDAVSync:notifyLibraryRefresh(local_folder, downloaded_rels)
+    if not downloaded_rels or #downloaded_rels == 0 then return end
+    if type(local_folder) ~= "string" or local_folder == "" then return end
+    local trimmed = local_folder:gsub("/+$", "")
+
+    local seen = {}
+    for _, rel in ipairs(downloaded_rels) do
+        local book_path
+        local stem, ext = rel:match("^(.+)%.sdr/metadata%.([^.]+)%.lua$")
+        if stem and ext then
+            book_path = trimmed .. "/" .. stem .. "." .. ext
+        elseif not rel:match("%.sdr/") then
+            book_path = trimmed .. "/" .. rel
+        end
+        if book_path and not seen[book_path] then
+            seen[book_path] = true
+            UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", book_path))
+        end
+    end
+
+    UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
 end
 
 function WebDAVSync:showTwoWaySummary(stats)
@@ -845,13 +900,16 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
         return
     end
 
+    local downloaded_rels = {}
     for _, a in ipairs(plan_obj.actions.to_download) do
-        sync.do_action(plan_obj, "download", a)
+        local ok = sync.do_action(plan_obj, "download", a)
+        if ok then table.insert(downloaded_rels, a.rel) end
     end
     for _, a in ipairs(plan_obj.actions.to_upload) do
         sync.do_action(plan_obj, "upload", a)
     end
     sync.save_cache(plan_obj)
+    self:notifyLibraryRefresh(plan_obj.local_folder, downloaded_rels)
 end
 
 function WebDAVSync:runProgressSync(opts)
@@ -897,12 +955,16 @@ function WebDAVSync:runProgressSync(opts)
         conflicts_skipped = 0,
         failed = 0,
         failures = {},
+        -- resolveConflictsInteractive appends conflict-resolved downloads here
+        -- when present; we feed the whole list to notifyLibraryRefresh.
+        downloaded_rels = {},
     }
 
     for _, a in ipairs(plan_obj.actions.to_download) do
         local ok, msg = sync.do_action(plan_obj, "download", a)
         if ok then
             stats.downloaded = stats.downloaded + 1
+            table.insert(stats.downloaded_rels, a.rel)
         else
             stats.failed = stats.failed + 1
             table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
@@ -923,6 +985,7 @@ function WebDAVSync:runProgressSync(opts)
     local conflicts = plan_obj.actions.conflicts
     local function finish()
         sync.save_cache(plan_obj)
+        self:notifyLibraryRefresh(plan_obj.local_folder, stats.downloaded_rels)
         if interactive then self:showProgressSummary(stats) end
         done()
     end

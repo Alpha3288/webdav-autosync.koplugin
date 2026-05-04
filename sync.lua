@@ -213,25 +213,27 @@ end
 
 --- Run a one-way sync (legacy behaviour). Lists remote, downloads anything
 --- matching the extension filter that doesn't already exist locally.
---- Returns: count_downloaded, count_skipped, error_message (nil on success).
+--- Returns: count_downloaded, count_skipped, error_message (nil on success),
+--- downloaded_rels (list of relpaths actually written this run; empty when
+--- everything was skipped or before the loop runs).
 local function run_sync(server_url, username, password, local_folder, progress_cb, extensions_filter)
     if not server_url or type(server_url) ~= "string" then
-        return 0, 0, "Server URL is not set"
+        return 0, 0, "Server URL is not set", {}
     end
     server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
     if server_url == "" then
-        return 0, 0, "Server URL is not set"
+        return 0, 0, "Server URL is not set", {}
     end
     if not webdav.url_has_host(server_url) then
-        return 0, 0, "Server URL has no host (e.g. use https://example.com/webdav)"
+        return 0, 0, "Server URL has no host (e.g. use https://example.com/webdav)", {}
     end
     if not local_folder or local_folder == "" then
-        return 0, 0, "Download folder is not set"
+        return 0, 0, "Download folder is not set", {}
     end
     local_folder = local_folder:gsub("/+$", "")
     local list, code, err = webdav.list_all(server_url, username, password)
     if not list then
-        return 0, 0, "List failed: " .. tostring(code) .. " " .. tostring(err)
+        return 0, 0, "List failed: " .. tostring(code) .. " " .. tostring(err), {}
     end
     local base = base_path_from_url(server_url)
     local extensions_set = parse_extensions(extensions_filter)
@@ -245,6 +247,7 @@ local function run_sync(server_url, username, password, local_folder, progress_c
     local count_fail = 0
     local count_skipped = 0
     local failed_files = {}
+    local downloaded_rels = {}
     for i, e in ipairs(files) do
         local remote_url = e.href_full or e.href
         if not remote_url:match("^https?://") then
@@ -262,6 +265,7 @@ local function run_sync(server_url, username, password, local_folder, progress_c
             local ok, msg = webdav.download_file(remote_url, local_path, username, password)
             if ok then
                 count_ok = count_ok + 1
+                table.insert(downloaded_rels, rel)
             else
                 count_fail = count_fail + 1
                 local filename = rel:match("([^/]+)$") or rel
@@ -271,9 +275,9 @@ local function run_sync(server_url, username, password, local_folder, progress_c
     end
     if (tonumber(count_fail) or 0) > 0 then
         local error_msg = tostring(count_fail) .. " file(s) failed:\n" .. table.concat(failed_files, "\n")
-        return count_ok, count_fail, error_msg
+        return count_ok, count_fail, error_msg, downloaded_rels
     end
-    return count_ok, count_skipped, nil
+    return count_ok, count_skipped, nil, downloaded_rels
 end
 
 --- Diff remote, local, and cache indices into action lists. Used by both
