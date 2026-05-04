@@ -62,6 +62,20 @@ local function get_cooldown()
     return v
 end
 
+-- Master gate: when off, no auto trigger (startup, Resume, close) does
+-- anything. Manual entry points (menu items, Dispatcher actions) bypass.
+local function is_master_on()
+    return G_reader_settings and G_reader_settings:isTrue("webdav_autosync_master")
+end
+
+-- Per-event toggle, gated by the master. The master being off forces every
+-- event toggle to read as off — handlers don't need to check both. Manual
+-- runs do not pass through here.
+local function event_enabled(event_key)
+    if not is_master_on() then return false end
+    return G_reader_settings:isTrue("webdav_autosync_" .. event_key)
+end
+
 local function should_run_auto()
     local cooldown = get_cooldown()
     if cooldown <= 0 then return true end
@@ -99,11 +113,12 @@ function WebDAVSync:init()
     local ui_kind = (self.ui and self.ui.document) and "reader" or "filemanager"
     logger.dbg("webdav_autosync: init ui=" .. ui_kind)
     -- Startup is an interactive trigger: surface deferred conflicts via
-    -- dialog. The runners gate themselves (toggle off, no config, offline)
-    -- so the calls are safe even when nothing is configured yet. Chained
-    -- via on_done — progress first, then book — so the conflict dialog
-    -- chains never overlap on screen. Cooldown is consumed up here so the
-    -- chain counts as a single auto-trigger slot.
+    -- dialog. Per-event toggles gate the call site (no need to invoke a
+    -- runner whose toggle is off); the runners still bail on no-config /
+    -- offline / wrong metadata-folder mode internally. Chained via on_done
+    -- — progress first, then book — so the conflict dialog chains never
+    -- overlap on screen. Cooldown is consumed up here so the chain counts
+    -- as a single auto-trigger slot.
     --
     -- Only schedule once per KOReader process — see the comment on
     -- startup_sync_scheduled above. Subsequent init() calls (from the
@@ -115,17 +130,31 @@ function WebDAVSync:init()
     startup_sync_scheduled = true
     logger.dbg("webdav_autosync: init scheduling startup sync in 2s ui=" .. ui_kind)
     UIManager:scheduleIn(2, function()
+        local progress_on = event_enabled("progress_on_startup")
+        local books_on = event_enabled("books_on_startup")
+        if not progress_on and not books_on then
+            logger.dbg("webdav_autosync: trigger=startup skip reason=disabled")
+            return
+        end
         if not should_run_auto() then
             logger.dbg("webdav_autosync: trigger=startup skip reason=cooldown")
             return
         end
         mark_auto_run()
-        logger.info("webdav_autosync: trigger=startup")
-        self:doProgressSync({
-            trigger = "startup",
-            interactive = true,
-            on_done = function() self:maybeRunBookAutoSync() end,
-        })
+        logger.info(string.format(
+            "webdav_autosync: trigger=startup progress=%s books=%s",
+            tostring(progress_on), tostring(books_on)))
+        if progress_on then
+            self:doProgressSync({
+                trigger = "startup",
+                interactive = true,
+                on_done = function()
+                    if books_on then self:maybeRunBookAutoSync() end
+                end,
+            })
+        else
+            self:maybeRunBookAutoSync()
+        end
     end)
 end
 
@@ -177,16 +206,6 @@ function WebDAVSync:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Auto-sync books"),
-                checked_func = function()
-                    return G_reader_settings:isTrue("webdav_autosync_books_auto")
-                end,
-                callback = function()
-                    G_reader_settings:flipNilOrFalse("webdav_autosync_books_auto")
-                end,
-                help_text = _("When enabled, runs book sync automatically at KOReader startup and after the device wakes from sleep. File-manager only, debounced to once per 60 seconds."),
-            },
-            {
                 text = _("Two-way book sync (upload local changes)"),
                 checked_func = function()
                     return G_reader_settings:isTrue("webdav_autosync_books_two_way")
@@ -197,25 +216,100 @@ function WebDAVSync:addToMainMenu(menu_items)
                 help_text = _("Affects book sync only. Off: download-only. On: also upload local additions and changes; conflicts (a file changed on both sides) prompt per file."),
             },
             {
-                text = _("Auto-sync reading progress"),
-                keep_menu_open = true,
-                checked_func = function()
-                    return G_reader_settings:isTrue("webdav_autosync_progress_auto")
-                end,
-                callback = function()
-                    G_reader_settings:flipNilOrFalse("webdav_autosync_progress_auto")
-                end,
-                help_text = _("When enabled, syncs .sdr sidecars (reading position, bookmarks, highlights) on book close (just the closed book), device wake, and KOReader startup. Conflicts on close are deferred to the next wake or startup. Off by default."),
-            },
-            {
-                text_func = function()
-                    return T(_("Auto sync cooldown: %1 s"), tostring(get_cooldown()))
-                end,
-                keep_menu_open = true,
-                callback = function()
-                    self:setCooldown()
-                end,
-                help_text = _("Minimum seconds between auto-triggered syncs (book close, device wake, KOReader startup). Manual syncs and closing a different book always run regardless. 0 disables the cooldown. Default 120 s."),
+                text = _("Auto sync triggers"),
+                sub_item_table = {
+                    {
+                        text = _("Enable auto sync"),
+                        checked_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_master")
+                        end,
+                        callback = function()
+                            G_reader_settings:flipNilOrFalse("webdav_autosync_master")
+                        end,
+                        help_text = _("Master switch for every automatic trigger below. Off: nothing fires automatically (manual sync still works). On: each individual trigger toggle takes effect."),
+                        separator = true,
+                    },
+                    {
+                        text = _("Sync books on startup"),
+                        enabled_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_master")
+                        end,
+                        checked_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_books_on_startup")
+                        end,
+                        callback = function()
+                            G_reader_settings:flipNilOrFalse("webdav_autosync_books_on_startup")
+                        end,
+                        help_text = _("Run book sync once when KOReader starts. File-manager context only."),
+                    },
+                    {
+                        text = _("Sync books on wake"),
+                        enabled_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_master")
+                        end,
+                        checked_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_books_on_resume")
+                        end,
+                        callback = function()
+                            G_reader_settings:flipNilOrFalse("webdav_autosync_books_on_resume")
+                        end,
+                        help_text = _("Run book sync after the device wakes from sleep. File-manager context only."),
+                        separator = true,
+                    },
+                    {
+                        text = _("Sync reading progress on startup"),
+                        enabled_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_master")
+                        end,
+                        checked_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_progress_on_startup")
+                        end,
+                        callback = function()
+                            G_reader_settings:flipNilOrFalse("webdav_autosync_progress_on_startup")
+                        end,
+                        help_text = _("Reconcile every .sdr sidecar (reading position, bookmarks, highlights) once when KOReader starts. Conflicts pop a per-file dialog."),
+                    },
+                    {
+                        text = _("Sync reading progress on wake"),
+                        enabled_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_master")
+                        end,
+                        checked_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_progress_on_resume")
+                        end,
+                        callback = function()
+                            G_reader_settings:flipNilOrFalse("webdav_autosync_progress_on_resume")
+                        end,
+                        help_text = _("Reconcile every .sdr sidecar after the device wakes from sleep. Conflicts pop a per-file dialog."),
+                    },
+                    {
+                        text = _("Sync reading progress on book close"),
+                        enabled_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_master")
+                        end,
+                        checked_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_progress_on_close")
+                        end,
+                        callback = function()
+                            G_reader_settings:flipNilOrFalse("webdav_autosync_progress_on_close")
+                        end,
+                        help_text = _("Push the just-closed book's .sdr sidecar (one network request, scoped to that book). Silent — conflicts are held for the next wake/startup trigger."),
+                        separator = true,
+                    },
+                    {
+                        text_func = function()
+                            return T(_("Auto sync cooldown: %1 s"), tostring(get_cooldown()))
+                        end,
+                        enabled_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_master")
+                        end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self:setCooldown()
+                        end,
+                        help_text = _("Minimum seconds between auto-triggered syncs (book close, device wake, KOReader startup). Manual syncs and closing a different book always run regardless. 0 disables the cooldown. Default 120 s."),
+                    },
+                },
             },
             {
                 text = _("Help"),
@@ -248,6 +342,10 @@ end
 -- within the cooldown is skipped. Conflicts are silently deferred — they
 -- re-surface at the next interactive trigger (Resume or startup).
 function WebDAVSync:onCloseDocument()
+    if not event_enabled("progress_on_close") then
+        logger.dbg("webdav_autosync: trigger=close skip reason=disabled")
+        return
+    end
     local doc = self.ui and self.ui.document
     if not doc or not doc.file then
         logger.dbg("webdav_autosync: trigger=close skip reason=no-document")
@@ -289,17 +387,31 @@ end
 -- sync starts only once progress sync has fully resolved its conflicts.
 -- Cooldown is consumed up here so the chain counts as a single auto slot.
 function WebDAVSync:onResume()
+    local progress_on = event_enabled("progress_on_resume")
+    local books_on = event_enabled("books_on_resume")
+    if not progress_on and not books_on then
+        logger.dbg("webdav_autosync: trigger=resume skip reason=disabled")
+        return
+    end
     if not should_run_auto() then
         logger.dbg("webdav_autosync: trigger=resume skip reason=cooldown")
         return
     end
     mark_auto_run()
-    logger.info("webdav_autosync: trigger=resume")
-    self:doProgressSync({
-        trigger = "resume",
-        interactive = true,
-        on_done = function() self:maybeRunBookAutoSync() end,
-    })
+    logger.info(string.format(
+        "webdav_autosync: trigger=resume progress=%s books=%s",
+        tostring(progress_on), tostring(books_on)))
+    if progress_on then
+        self:doProgressSync({
+            trigger = "resume",
+            interactive = true,
+            on_done = function()
+                if books_on then self:maybeRunBookAutoSync() end
+            end,
+        })
+    else
+        self:maybeRunBookAutoSync()
+    end
 end
 
 function WebDAVSync:getSetting(key, default)
@@ -821,14 +933,10 @@ end
 --- runTwoWaySync path. No `interactive` parameter is needed — runTwoWaySync
 --- always pops the conflict dialog chain (the `is_auto` silent-skip branch
 --- was removed when the chain was wired up). The unified auto-trigger
---- cooldown is enforced by the event handler before this is called, so we
---- don't re-check here. File-manager-only — a full library scan inside a
---- reader context would be disruptive.
+--- cooldown and per-event toggles are enforced by the event handler before
+--- this is called, so we don't re-check them here. File-manager-only — a
+--- full library scan inside a reader context would be disruptive.
 function WebDAVSync:maybeRunBookAutoSync()
-    if not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_books_auto")) then
-        logger.dbg("webdav_autosync: book auto-sync skip reason=toggle-off")
-        return
-    end
     if self.ui.document then
         logger.dbg("webdav_autosync: book auto-sync skip reason=reader-context")
         return
@@ -863,10 +971,9 @@ function WebDAVSync:doProgressSync(opts)
     local on_done = opts.on_done
     local function done() if on_done then on_done() end end
 
-    if not manual and not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_progress_auto")) then
-        logger.dbg("webdav_autosync: progress sync skip reason=toggle-off")
-        return done()
-    end
+    -- The per-event toggle gating happens in the event handlers (init,
+    -- onResume) before they call us; manual entry points bypass the toggles
+    -- entirely. So no toggle check here.
 
     -- Cheap config check first: skip remaining work entirely (incl. the
     -- network probe below) on installs that aren't configured yet.
@@ -947,10 +1054,8 @@ end
 --- as doProgressSync: the toggle, the `doc` metadata-folder requirement,
 --- server/folder configured, online.
 function WebDAVSync:doProgressSyncForBook(book_rel)
-    if not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_progress_auto")) then
-        logger.dbg("webdav_autosync: close-trigger sync skip reason=toggle-off book=" .. tostring(book_rel))
-        return
-    end
+    -- Gating (master + progress_on_close) is enforced by onCloseDocument
+    -- before this runs; we don't re-check here.
 
     local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
     if meta_mode ~= "doc" then
@@ -1131,17 +1236,14 @@ WHAT EACH MENU ITEM DOES
 • Set file extensions (optional)
   Comma- or space-separated list (e.g. epub, pdf, txt). Empty = all KOReader-supported formats. Applies to book sync only; progress sync ignores this setting.
 
-• Auto-sync books
-  Run book sync automatically at KOReader startup and after the device wakes from sleep. File-manager context only, debounced to once per 60 seconds.
-
 • Two-way book sync (upload local changes)
   Affects book sync only. Off: download-only. On: also upload local additions and changes, and prompt on conflicts.
 
-• Auto-sync reading progress
-  Run progress sync automatically on book close (silent, just the closed book), device wake (interactive, full reconcile), and KOReader startup (interactive, full reconcile). Conflicts on close are held for the next interactive trigger.
-
-• Auto sync cooldown
-  Minimum seconds between auto-triggered syncs (book close, device wake, KOReader startup). Manual syncs and closing a *different* book always run regardless of the cooldown. Default 120 s. Set to 0 to disable the cooldown.
+• Auto sync triggers (submenu)
+  - Enable auto sync — master switch. Off: nothing fires automatically (manual sync still works). On: each individual trigger toggle below takes effect.
+  - Sync books on startup / on wake — when on, run book sync at KOReader startup and/or when the device wakes. File-manager context only.
+  - Sync reading progress on startup / on wake / on book close — when on, run progress sync at startup, on wake, and/or after closing a book. The startup and wake triggers reconcile the whole library; the book-close trigger pushes only the just-closed book (one network request) and silently defers any conflict to the next startup/wake.
+  - Auto sync cooldown — minimum seconds between auto-triggered syncs. Manual syncs and closing a *different* book always run regardless. Default 120 s. Set to 0 to disable.
 
 HOW TO SET IT UP
 
@@ -1149,9 +1251,8 @@ HOW TO SET IT UP
 2. Tap "Choose download folder" and long-press the folder where you want books stored.
 3. (Optional) Tap "Set file extensions" if you only want certain formats.
 4. Tap "Sync books now" to do an initial download.
-5. Toggle "Auto-sync books" on if you want startup/wake auto-runs.
-6. Toggle "Two-way book sync" on if you also want local additions to upload.
-7. Toggle "Auto-sync reading progress" on if you want reading state to round-trip across devices.
+5. (Optional) Toggle "Two-way book sync" on if you also want local additions to upload.
+6. Open "Auto sync triggers", flip "Enable auto sync" on, then turn on the specific event toggles you want (book / progress, on startup / wake / close).
 
 NOTES
 
