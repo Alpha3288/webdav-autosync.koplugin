@@ -42,6 +42,13 @@ local WebDAVSync = WidgetContainer:extend{
 -- Closing the *same* book within the cooldown is the redundant case we skip.
 local auto_sync_last_run = 0
 local last_close_book_rel = nil
+-- Set true the first time init() schedules its startup sync this KOReader
+-- process. Each FileManager↔ReaderUI transition re-instantiates the plugin
+-- and re-runs init(); without this guard, opening a book or closing it back
+-- to the file manager would re-fire a full-library progress sync (and the
+-- chained book sync on the close-into-FM transition) every time the cooldown
+-- window had already elapsed.
+local startup_sync_scheduled = false
 local DEFAULT_COOLDOWN = 120
 local COOLDOWN_MIN = 0
 local COOLDOWN_MAX = 1800
@@ -95,6 +102,12 @@ function WebDAVSync:init()
     -- via on_done — progress first, then book — so the conflict dialog
     -- chains never overlap on screen. Cooldown is consumed up here so the
     -- chain counts as a single auto-trigger slot.
+    --
+    -- Only schedule once per KOReader process — see the comment on
+    -- startup_sync_scheduled above. Subsequent init() calls (from the
+    -- FM↔Reader transition's fresh plugin instance) skip this block.
+    if startup_sync_scheduled then return end
+    startup_sync_scheduled = true
     UIManager:scheduleIn(2, function()
         if not should_run_auto() then return end
         mark_auto_run()
