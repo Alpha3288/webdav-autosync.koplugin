@@ -33,9 +33,13 @@ Three Lua modules form a thin pipeline. Read them in this order to understand th
 main.lua     UI/menu/settings + lifecycle event handlers
              (WidgetContainer subclass — file manager AND reader contexts).
    |
-   v   doSync({is_auto = ...})        doProgressSync({manual,interactive})
-sync.lua     Books: run_sync (one-way) | plan / do_action / save_cache (two-way).
-             Progress: plan_progress (two-way over .sdr sidecars only).
+   v   doSync({is_auto = ...})         book full-library
+   v   doProgressSync({manual,         progress full-library
+   v                  interactive})
+   v   doProgressSyncForBook(book_rel) progress scoped (one PROPFIND, close trigger)
+sync.lua     Books: run_sync (one-way) | plan (two-way).
+             Progress: plan_progress (full library) | plan_progress_book (one book).
+             Shared: diff_indices, do_action, save_cache.
    |
    v   uses
 webdav.lua   WebDAV client (PROPFIND list, GET download, PUT upload, MKCOL).
@@ -44,12 +48,15 @@ webdav.lua   WebDAV client (PROPFIND list, GET download, PUT upload, MKCOL).
 Non-obvious points across files:
 
 - **Settings namespace**: every setting is keyed `webdav_autosync_<name>` in `G_reader_settings`. The `getSetting`/`saveSetting` helpers in `main.lua` add the prefix automatically — call them, don't touch `G_reader_settings` directly except for the three toggle flags `webdav_autosync_books_auto`, `webdav_autosync_books_two_way`, and `webdav_autosync_progress_auto`. (These were renamed from `webdav_autosync_enabled`, `webdav_autosync_two_way`, and `webdav_autosync_progress` in v1.2.0 to disambiguate book vs progress sync; no migration shim — users on the old keys had their toggles reset to default.)
-- **Trigger taxonomy** — the plugin's automatic syncs (book and progress) are gated by two module-local time-debounce timestamps in `main.lua`: `book_sync_last_run` (60 s cool-down, used by `maybeRunBookAutoSync`) and `progress_sync_last_run` (30 s cool-down, used by `doProgressSync`). The earlier once-per-session boolean (`auto_sync_started`) was deliberately replaced when book sync gained a `Resume` trigger in addition to startup; do not reintroduce per-session booleans for either sync.
-- **Silent vs interactive triggers** — both syncs share the same rule:
-  - *Silent* (`onCloseDocument`, `onSuspend`): execute non-conflicting actions; conflicts are **deferred** (not resolved, not reported, not even cached as resolved). The next planner pass re-detects them.
-  - *Interactive* (`onResume`, plugin `init()` startup, manual menu/Dispatcher entry): execute non-conflicting actions, then chain `resolveConflictsInteractive` over any pending conflicts (Keep local / Keep remote / Skip).
+- **Trigger taxonomy and unified cooldown** — automatic syncs (book and progress) are gated by a single shared cooldown in `main.lua`: module-local `auto_sync_last_run` + `AUTO_SYNC_COOLDOWN` (120 s). The cooldown check lives at the *event-handler level*, not inside the runners — once a chain (e.g. Resume's progress → book sync via `on_done`) is admitted, it runs to completion as one logical operation under one cooldown slot. Manual entry points call `mark_auto_run()` at start to bump the timestamp without checking, so subsequent auto triggers debounce naturally.
+  - **Per-book carve-out for close**: `last_close_book_rel` tracks which book the last close-triggered sync was for. Closing a *different* book bypasses `should_run_auto()` because each book's `.sdr/` is independent — no overlap with the prior sync, no rate-limit benefit to skipping it. Only consecutive closes of the *same* book are debounced.
+  - There were previously per-type debounces (`progress_sync_last_run` 30 s, `book_sync_last_run` 60 s) and an even earlier once-per-session boolean (`auto_sync_started`); both were replaced when the trigger taxonomy was simplified for v1.3.0. Don't reintroduce per-type cooldowns or per-session booleans.
+- **Silent vs interactive triggers**:
+  - *Silent* — `onCloseDocument`: scoped sync of just the closed book's `.sdr/` via `sync.plan_progress_book` (one PROPFIND, no full library walk). Conflicts are **deferred** (not resolved, not reported, cache rows for conflicting entries are not updated). The next interactive trigger re-detects and surfaces them.
+  - *Interactive* — `onResume`, plugin `init()` startup, manual menu/Dispatcher entry: full-library reconcile via `plan_progress`, then chain `resolveConflictsInteractive` over any pending conflicts.
   - Auto interactive triggers (Resume, startup) silently no-op when offline; manual triggers prompt for Wi-Fi via the existing `ConfirmBox` path.
-  - Book auto-sync only fires from the *interactive* event set (init + Resume); book close and Suspend are progress-only.
+  - **`onSuspend` is intentionally absent.** It existed in v1.1.0–v1.2.x but was removed in v1.3.0 — Suspend can't show interactive UI, and a full library walk during suspension burns rate-limit budget on quota-enforcing WebDAV servers for limited benefit (the close trigger already pushed the just-edited book; the rest of the library hasn't changed in the second between close and suspend). Reintroducing it requires a strong reason.
+  - Book auto-sync only fires from the interactive event set (init + Resume, chained after progress sync via `on_done`); the close trigger is progress-only and scoped.
   - Book auto-sync is still **file-manager-only** (`not self.ui.document`) — running a full library scan from inside a reader context is disruptive. Progress sync runs in either context.
 - **`webdav.lua` mirrors KOReader's own `apps/cloudstorage/webdavapi.lua`**: trailing slash required for PROPFIND, minimal `<allprop/>` body, `user`/`password` go in the request table (not as an `Authorization: Basic …` header), timeouts use `socketutil:set_timeout()`. Diverging from this pattern has historically broken servers like Nextcloud — keep parity unless there's a strong reason not to.
 - **Recursion in `webdav.list_all`** issues one PROPFIND per directory with `Depth: 1`. The recursion's self-skip (`e_path_norm ~= url_path`) prevents the parent from re-listing itself; removing that check causes infinite recursion.
@@ -70,11 +77,12 @@ Non-obvious points across files:
   - **Upload path**: `webdav.upload_file` does PUT; `webdav.ensure_remote_dirs` walks parent path segments and MKCOLs each (treating 405 = already exists as success). PUT response ETag is captured when the server provides one; if absent, the next PROPFIND fills it in for subsequent change detection.
 
 - **Progress sync** (opt-in via the `webdav_autosync_progress_auto` toggle, default off):
-  - Reuses the two-way machinery via `sync.plan_progress` (alongside `sync.plan`); `do_action`, `save_cache`, and `resolveConflictsInteractive` are shared with book sync without modification. The shared `diff_indices` helper in `sync.lua` is what makes that work — `plan` and `plan_progress` only differ in how they build the remote/local indices.
-  - **Triggered by**: `onCloseDocument` (silent), `onSuspend` (silent), `onResume` (interactive), `init()` (interactive). Plus the `webdav_progress_sync_now` Dispatcher action and the "Sync reading progress now" menu item, which are always interactive and bypass the debounce.
+  - Reuses the two-way machinery via `sync.plan_progress` and `sync.plan_progress_book` (alongside `sync.plan`); `do_action`, `save_cache`, and `resolveConflictsInteractive` are shared with book sync without modification. The shared `diff_indices` helper in `sync.lua` is what makes that work — the three planners only differ in how they build the remote/local indices.
+  - **Triggered by**: `onCloseDocument` (silent, **scoped to the just-closed book** via `plan_progress_book` — one PROPFIND), `onResume` (interactive, full reconcile via `plan_progress`), `init()` (interactive, full reconcile). Plus the `webdav_progress_sync_now` Dispatcher action and the "Sync reading progress now" menu item, which are always interactive, full-library, and bypass the cooldown.
+  - **Why close is scoped, not full-library**: rate-limited WebDAV providers returned 400s under v1.1.0–v1.2.x's pattern of running a full recursive PROPFIND on every close. v1.3.0 changed the close trigger to walk only `<book>.sdr/` — one network round-trip per close. The catch-up moments (Resume, startup, manual) still do the full reconcile. Don't expand the close trigger back to a full walk without first proving the rate-limit story has changed.
   - **Sidecar location requirement**: only KOReader's default `document_metadata_folder = "doc"` is supported, since only that mode places `.sdr` directories inside the synced library tree. With `dir` or `hash` modes the sidecars are off-tree and have no remote mapping; silent triggers no-op (one debug log line), interactive manual triggers show an `InfoMessage` explaining the limit. Do not try to chase per-mode sidecar paths — the remote layout has no place for them.
-  - **Why we don't auto-resolve progress conflicts via mtime**: an earlier draft proposed mtime-wins on close/suspend so cross-device reading would be self-healing. We dropped it: the user wants conflicts surfaced explicitly at the next interactive moment. Don't reintroduce auto-resolve without explicit say-so.
-  - **`is_doc_only = false`** stays — without it, lifecycle events fired by the reader (`CloseDocument`, `Suspend`, `Resume`) wouldn't reach the plugin.
+  - **Why we don't auto-resolve progress conflicts via mtime**: an earlier draft proposed mtime-wins on close so cross-device reading would be self-healing. We dropped it: the user wants conflicts surfaced explicitly at the next interactive moment. Don't reintroduce auto-resolve without explicit say-so.
+  - **`is_doc_only = false`** stays — without it, lifecycle events fired by the reader (`CloseDocument`, `Resume`) wouldn't reach the plugin.
 
 ## Releases
 

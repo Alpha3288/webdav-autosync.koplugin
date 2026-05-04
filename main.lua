@@ -29,15 +29,36 @@ local WebDAVSync = WidgetContainer:extend{
     is_doc_only = false,
 }
 
--- Time-debounce timestamps (epoch seconds). Module-local so they're shared
+-- Single global cooldown shared across all auto trigger paths (close, Resume,
+-- startup, and the chained book auto-sync). Module-local so it's shared
 -- across the FileManager and ReaderUI plugin instances — KOReader broadcasts
--- Suspend/Resume to both, and we want at most one sync per cool-down window.
--- Replaces the old once-per-session boolean so the same code path can fire
--- from init(), onResume, and the lifecycle event handlers.
-local progress_sync_last_run = 0
-local book_sync_last_run = 0
-local PROGRESS_SYNC_COOLDOWN = 30
-local BOOK_SYNC_COOLDOWN = 60
+-- Resume to both, and we want at most one sync per cool-down window.
+--
+-- last_close_book_rel carves out the per-book exception for the close trigger:
+-- closing a *different* book hits a different `.sdr/`, so it's not redundant
+-- with the prior sync and is allowed regardless of the global cooldown.
+-- Closing the *same* book within the cooldown is the redundant case we skip.
+local auto_sync_last_run = 0
+local last_close_book_rel = nil
+local AUTO_SYNC_COOLDOWN = 120
+
+local function should_run_auto()
+    return os.time() - auto_sync_last_run >= AUTO_SYNC_COOLDOWN
+end
+
+local function should_run_close(book_rel)
+    if book_rel ~= last_close_book_rel then return true end
+    return should_run_auto()
+end
+
+local function mark_auto_run()
+    auto_sync_last_run = os.time()
+end
+
+local function mark_close_run(book_rel)
+    auto_sync_last_run = os.time()
+    last_close_book_rel = book_rel
+end
 
 function WebDAVSync:init()
     Dispatcher:registerAction("webdav_sync_now", {
@@ -53,12 +74,15 @@ function WebDAVSync:init()
         general = true,
     })
     self.ui.menu:registerToMainMenu(self)
-    -- Startup is an interactive trigger: surface deferred conflicts via dialog.
-    -- Both helpers gate themselves (toggle off, no config, debounce, offline)
-    -- so the calls are safe even when nothing is configured yet. Chained via
-    -- on_done — progress first, then book — so the conflict dialog chains
-    -- never overlap on screen.
+    -- Startup is an interactive trigger: surface deferred conflicts via
+    -- dialog. The runners gate themselves (toggle off, no config, offline)
+    -- so the calls are safe even when nothing is configured yet. Chained
+    -- via on_done — progress first, then book — so the conflict dialog
+    -- chains never overlap on screen. Cooldown is consumed up here so the
+    -- chain counts as a single auto-trigger slot.
     UIManager:scheduleIn(2, function()
+        if not should_run_auto() then return end
+        mark_auto_run()
         self:doProgressSync({
             trigger = "startup",
             interactive = true,
@@ -75,12 +99,14 @@ function WebDAVSync:addToMainMenu(menu_items)
             {
                 text = _("Sync books now"),
                 callback = function()
+                    mark_auto_run()
                     self:doSync()
                 end,
             },
             {
                 text = _("Sync reading progress now"),
                 callback = function()
+                    mark_auto_run()
                     self:doProgressSync({ manual = true })
                 end,
             },
@@ -141,7 +167,7 @@ function WebDAVSync:addToMainMenu(menu_items)
                 callback = function()
                     G_reader_settings:flipNilOrFalse("webdav_autosync_progress_auto")
                 end,
-                help_text = _("When enabled, syncs .sdr sidecars (reading position, bookmarks, highlights) on book close, device sleep, wake, and KOReader startup. Conflicts are deferred to the next wake or startup. Off by default."),
+                help_text = _("When enabled, syncs .sdr sidecars (reading position, bookmarks, highlights) on book close (just the closed book), device wake, and KOReader startup. Conflicts on close are deferred to the next wake or startup. Off by default."),
             },
             {
                 text = _("Help"),
@@ -155,31 +181,50 @@ function WebDAVSync:addToMainMenu(menu_items)
 end
 
 function WebDAVSync:onWebDAVSyncNow()
+    mark_auto_run()
     self:doSync()
     return true
 end
 
 function WebDAVSync:onWebDAVProgressSyncNow()
+    mark_auto_run()
     self:doProgressSync({ manual = true })
     return true
 end
 
--- Silent triggers: run progress sync without surfacing conflicts. Conflicting
--- entries are left untouched (their cache rows are not updated), so they
--- re-surface on the next interactive trigger.
+-- Close trigger: scoped to just the closed book's `.sdr/` (one PROPFIND).
+-- Per-book debounce: closing a *different* book always runs (different
+-- sidecar dir, no overlap with the prior sync); closing the same book
+-- within the cooldown is skipped. Conflicts are silently deferred — they
+-- re-surface at the next interactive trigger (Resume or startup).
 function WebDAVSync:onCloseDocument()
-    self:doProgressSync({ trigger = "close", interactive = false })
-end
+    local doc = self.ui and self.ui.document
+    if not doc or not doc.file then return end
 
-function WebDAVSync:onSuspend()
-    self:doProgressSync({ trigger = "suspend", interactive = false })
+    local local_folder = self:getSetting("download_folder", "")
+    if type(local_folder) ~= "string" or local_folder == "" then return end
+    local trimmed = local_folder:gsub("/+$", "")
+
+    -- Book opened from outside the synced library — no remote mapping; no-op.
+    -- Don't fall back to a full-library walk on close, that defeats the
+    -- whole reason this trigger is scoped.
+    if doc.file:sub(1, #trimmed + 1) ~= trimmed .. "/" then return end
+    local book_rel = doc.file:sub(#trimmed + 2)
+    if book_rel == "" then return end
+
+    if not should_run_close(book_rel) then return end
+    mark_close_run(book_rel)
+    self:doProgressSyncForBook(book_rel)
 end
 
 -- Resume: interactive for both syncs. The user is present, so conflicts pile
 -- up here as dialogs. We chain progress → book auto-sync via on_done so the
 -- two dialog chains can't end up stacked on screen at the same time; book
 -- sync starts only once progress sync has fully resolved its conflicts.
+-- Cooldown is consumed up here so the chain counts as a single auto slot.
 function WebDAVSync:onResume()
+    if not should_run_auto() then return end
+    mark_auto_run()
     self:doProgressSync({
         trigger = "resume",
         interactive = true,
@@ -610,28 +655,24 @@ function WebDAVSync:turnOffWifiIfRequested(ctx)
     end
 end
 
---- Interactive book auto-sync trigger. Called from init() (startup) and
---- onResume; both contexts have the user present, so conflicts surface as
---- dialogs via the existing runTwoWaySync path. No `interactive` parameter
---- is needed — runTwoWaySync now always pops the conflict dialog chain
---- (the `is_auto` silent-skip branch was removed when this trigger was
---- added). Replaces the old once-per-session boolean with a 60-second
---- time-debounce so the same code can fire from multiple events.
---- File-manager-only — a full library scan inside a reader context would
---- be disruptive.
+--- Interactive book auto-sync trigger. Called from init() (startup) and as
+--- the on_done callback chained from onResume's progress sync; both contexts
+--- have the user present, so conflicts surface as dialogs via the existing
+--- runTwoWaySync path. No `interactive` parameter is needed — runTwoWaySync
+--- always pops the conflict dialog chain (the `is_auto` silent-skip branch
+--- was removed when the chain was wired up). The unified auto-trigger
+--- cooldown is enforced by the event handler before this is called, so we
+--- don't re-check here. File-manager-only — a full library scan inside a
+--- reader context would be disruptive.
 function WebDAVSync:maybeRunBookAutoSync()
     if not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_books_auto")) then
         return
     end
     if self.ui.document then return end
 
-    local now = os.time()
-    if now - book_sync_last_run < BOOK_SYNC_COOLDOWN then return end
-
     local NetworkMgr = require("ui/network/manager")
     if NetworkMgr.isOnline and not NetworkMgr:isOnline() then return end
 
-    book_sync_last_run = now
     self:doSync({ is_auto = true })
 end
 
@@ -690,12 +731,13 @@ function WebDAVSync:doProgressSync(opts)
         return done()
     end
 
+    -- The unified auto-trigger cooldown is enforced by the event handlers
+    -- (onResume, onCloseDocument, init startup) before they call us. A
+    -- chained on_done call also lands here without re-checking, by design.
+    -- Manual entry points bumped the cooldown timestamp at their own start.
     local NetworkMgr = require("ui/network/manager")
     if not manual then
-        local now = os.time()
-        if now - progress_sync_last_run < PROGRESS_SYNC_COOLDOWN then return done() end
         if NetworkMgr.isOnline and not NetworkMgr:isOnline() then return done() end
-        progress_sync_last_run = now
         self:runProgressSync({
             server_url = server_url,
             local_folder = local_folder,
@@ -720,7 +762,6 @@ function WebDAVSync:doProgressSync(opts)
         return
     end
 
-    progress_sync_last_run = os.time()
     self:runProgressSync({
         server_url = server_url,
         local_folder = local_folder,
@@ -728,6 +769,50 @@ function WebDAVSync:doProgressSync(opts)
         manual = true,
         on_done = on_done,
     })
+end
+
+--- Silent scoped progress sync for one just-closed book. Called from
+--- onCloseDocument after the per-book debounce passes. One PROPFIND on
+--- `<book>.sdr/`, executes non-conflicting actions, leaves any conflicts
+--- pending (they'll surface at the next interactive trigger). Same gates
+--- as doProgressSync: the toggle, the `doc` metadata-folder requirement,
+--- server/folder configured, online.
+function WebDAVSync:doProgressSyncForBook(book_rel)
+    if not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_progress_auto")) then
+        return
+    end
+
+    local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
+    if meta_mode ~= "doc" then
+        logger.dbg("webdav_autosync: close-trigger sync skipped — metadata folder is " .. tostring(meta_mode))
+        return
+    end
+
+    local server_url = self:getSetting("server_url", "")
+    local local_folder = self:getSetting("download_folder", "")
+    if type(server_url) ~= "string" then server_url = "" end
+    if type(local_folder) ~= "string" then local_folder = "" end
+    server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
+    if server_url == "" or local_folder == "" then return end
+
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr.isOnline and not NetworkMgr:isOnline() then return end
+
+    local username = self:getSetting("username", "")
+    local password = self:getSetting("password", "")
+    local plan_obj, err = sync.plan_progress_book(server_url, username, password, local_folder, book_rel)
+    if not plan_obj then
+        logger.dbg("webdav_autosync: book progress plan failed: " .. tostring(err))
+        return
+    end
+
+    for _, a in ipairs(plan_obj.actions.to_download) do
+        sync.do_action(plan_obj, "download", a)
+    end
+    for _, a in ipairs(plan_obj.actions.to_upload) do
+        sync.do_action(plan_obj, "upload", a)
+    end
+    sync.save_cache(plan_obj)
 end
 
 function WebDAVSync:runProgressSync(opts)
@@ -841,7 +926,7 @@ WHAT EACH MENU ITEM DOES
   Affects book sync only. Off: download-only. On: also upload local additions and changes, and prompt on conflicts.
 
 • Auto-sync reading progress
-  Run progress sync automatically on book close (silent), device sleep (silent), wake (interactive), and KOReader startup (interactive). Silent triggers leave conflicts untouched and held for the next interactive trigger.
+  Run progress sync automatically on book close (silent, just the closed book), device wake (interactive, full reconcile), and KOReader startup (interactive, full reconcile). Conflicts on close are held for the next interactive trigger. To keep WebDAV traffic down, all auto triggers share a 120-second cooldown — but closing a *different* book always runs anyway, since each book's sidecar is independent.
 
 HOW TO SET IT UP
 

@@ -42,9 +42,9 @@ end
 --- PROPFIND body. Mirrors KOReader's apps/cloudstorage/webdavapi.lua at
 --- v2026.03 (prefixed namespace, explicit <prop> list rather than <allprop/>),
 --- extended with getetag and getlastmodified because two-way sync needs them
---- for change detection. Koofr — and other strict servers like some
---- ownCloud builds — return 400 Bad Request on <allprop/>, so the explicit
---- list isn't optional.
+--- for change detection. Some strict WebDAV servers (e.g. certain ownCloud
+--- builds and some hosted providers) return 400 Bad Request on <allprop/>,
+--- so the explicit list isn't optional.
 local PROPFIND_BODY = '<?xml version="1.0"?>' ..
     '<a:propfind xmlns:a="DAV:">' ..
         '<a:prop>' ..

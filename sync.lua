@@ -457,6 +457,88 @@ local function plan(server_url, username, password, local_folder, extensions_fil
     }
 end
 
+--- Compute the `.sdr` directory relpath for a book file relpath. KOReader's
+--- `doc` metadata-folder mode (the only mode this plugin supports) names the
+--- sidecar directory by replacing the file's extension with `.sdr`:
+---     Books/MyBook.epub  ->  Books/MyBook.sdr
+--- A file with no extension keeps its name and gets `.sdr` appended.
+local function sidecar_rel_for_book(book_rel)
+    local stem = book_rel:gsub("%.[^/.]+$", "")
+    return stem .. ".sdr"
+end
+
+--- Plan a scoped progress sync for a single book — one PROPFIND on
+--- `<book>.sdr/`, one local walk under that directory. Used by the
+--- CloseDocument trigger so closing a book costs one network request
+--- instead of a full library walk. The shared `cache_files` table can
+--- still hold relpaths from other books — they fall through diff_indices
+--- with `r = nil, l = nil` and are left alone.
+---
+--- Returns the same plan-object shape as `plan_progress`, so the caller
+--- consumes it via the same `do_action` / `save_cache` /
+--- `resolveConflictsInteractive` machinery.
+local function plan_progress_book(server_url, username, password, local_folder, book_rel)
+    local trimmed_folder, verr = validate_two_way_inputs(server_url, local_folder)
+    if not trimmed_folder then return nil, verr end
+    local_folder = trimmed_folder
+
+    if not book_rel or book_rel == "" then
+        return nil, "book relpath missing"
+    end
+
+    local sdr_rel = sidecar_rel_for_book(book_rel)
+    local sdr_url = build_remote_url(server_url, sdr_rel)
+
+    -- Single PROPFIND, depth 1. 404 means "no remote sidecar yet" —
+    -- treat as an empty remote so a fresh book's first close uploads
+    -- via ensure_remote_dirs + PUT.
+    local list, code, err = webdav.list_one(sdr_url, username, password, "1")
+    if not list then
+        if code == 404 then
+            list = {}
+        else
+            return nil, "List failed: " .. tostring(code) .. " " .. tostring(err)
+        end
+    end
+
+    local remote_index = build_remote_index(list, server_url, function(rel)
+        return is_syncable_sidecar(rel)
+    end)
+
+    -- Walk only the sdr subdirectory locally; rewrite relpaths back to
+    -- be relative to local_folder so cache keys match what
+    -- plan_progress (full walk) writes.
+    local local_index = {}
+    local sub_files = walk_local(local_folder .. "/" .. sdr_rel, function() return true end)
+    for sub_rel, info in pairs(sub_files) do
+        local full_rel = sdr_rel .. "/" .. sub_rel
+        if is_syncable_sidecar(full_rel) then
+            local_index[full_rel] = info
+        end
+    end
+
+    local cache = open_cache()
+    local cache_files = load_cache_files(cache)
+
+    local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
+            server_url, local_folder)
+
+    if cache_dirty then
+        cache:saveSetting("files", cache_files)
+        cache:flush()
+    end
+
+    return {
+        server_url = server_url,
+        username = username,
+        password = password,
+        local_folder = local_folder,
+        cache = cache,
+        cache_files = cache_files,
+        actions = actions,
+    }
+end
+
 --- Plan a two-way sync of `.sdr` sidecar content (reading position, bookmarks,
 --- highlights, custom metadata, custom cover). Same shape as `plan`; only the
 --- file selection differs (sidecar paths, no extension filter). The cache is
@@ -539,6 +621,7 @@ return {
     run_sync = run_sync,
     plan = plan,
     plan_progress = plan_progress,
+    plan_progress_book = plan_progress_book,
     do_action = do_action,
     save_cache = save_cache,
     KOREADER_DEFAULT_EXTENSIONS = KOREADER_DEFAULT_EXTENSIONS,
