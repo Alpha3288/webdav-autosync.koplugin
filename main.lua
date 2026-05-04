@@ -10,6 +10,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local ConfirmBox = require("ui/widget/confirmbox")
 local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
 local TextViewer = require("ui/widget/textviewer")
+local SpinWidget = require("ui/widget/spinwidget")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
@@ -40,10 +41,23 @@ local WebDAVSync = WidgetContainer:extend{
 -- Closing the *same* book within the cooldown is the redundant case we skip.
 local auto_sync_last_run = 0
 local last_close_book_rel = nil
-local AUTO_SYNC_COOLDOWN = 120
+local DEFAULT_COOLDOWN = 120
+local COOLDOWN_MIN = 0
+local COOLDOWN_MAX = 1800
+local COOLDOWN_STEP = 30
+
+local function get_cooldown()
+    local v = G_reader_settings and G_reader_settings:readSetting("webdav_autosync_cooldown_seconds")
+    if type(v) ~= "number" then return DEFAULT_COOLDOWN end
+    if v < COOLDOWN_MIN then return COOLDOWN_MIN end
+    if v > COOLDOWN_MAX then return COOLDOWN_MAX end
+    return v
+end
 
 local function should_run_auto()
-    return os.time() - auto_sync_last_run >= AUTO_SYNC_COOLDOWN
+    local cooldown = get_cooldown()
+    if cooldown <= 0 then return true end
+    return os.time() - auto_sync_last_run >= cooldown
 end
 
 local function should_run_close(book_rel)
@@ -168,6 +182,16 @@ function WebDAVSync:addToMainMenu(menu_items)
                     G_reader_settings:flipNilOrFalse("webdav_autosync_progress_auto")
                 end,
                 help_text = _("When enabled, syncs .sdr sidecars (reading position, bookmarks, highlights) on book close (just the closed book), device wake, and KOReader startup. Conflicts on close are deferred to the next wake or startup. Off by default."),
+            },
+            {
+                text_func = function()
+                    return T(_("Auto sync cooldown: %1 s"), tostring(get_cooldown()))
+                end,
+                keep_menu_open = true,
+                callback = function()
+                    self:setCooldown()
+                end,
+                help_text = _("Minimum seconds between auto-triggered syncs (book close, device wake, KOReader startup). Manual syncs and closing a different book always run regardless. 0 disables the cooldown. Default 120 s."),
             },
             {
                 text = _("Help"),
@@ -384,6 +408,23 @@ function WebDAVSync:setDownloadFolder()
         end,
     }
     UIManager:show(path_chooser)
+end
+
+function WebDAVSync:setCooldown()
+    UIManager:show(SpinWidget:new{
+        title_text = _("Auto sync cooldown (seconds)"),
+        info_text = _("Minimum seconds between auto-triggered syncs (book close, device wake, KOReader startup). Manual syncs and closing a different book always run regardless. Set to 0 to disable the cooldown."),
+        value = get_cooldown(),
+        value_min = COOLDOWN_MIN,
+        value_max = COOLDOWN_MAX,
+        value_step = COOLDOWN_STEP,
+        value_hold_step = COOLDOWN_STEP * 2,
+        default_value = DEFAULT_COOLDOWN,
+        ok_text = _("Set"),
+        callback = function(spin)
+            G_reader_settings:saveSetting("webdav_autosync_cooldown_seconds", spin.value)
+        end,
+    })
 end
 
 function WebDAVSync:setFileExtensions()
@@ -926,7 +967,10 @@ WHAT EACH MENU ITEM DOES
   Affects book sync only. Off: download-only. On: also upload local additions and changes, and prompt on conflicts.
 
 • Auto-sync reading progress
-  Run progress sync automatically on book close (silent, just the closed book), device wake (interactive, full reconcile), and KOReader startup (interactive, full reconcile). Conflicts on close are held for the next interactive trigger. To keep WebDAV traffic down, all auto triggers share a 120-second cooldown — but closing a *different* book always runs anyway, since each book's sidecar is independent.
+  Run progress sync automatically on book close (silent, just the closed book), device wake (interactive, full reconcile), and KOReader startup (interactive, full reconcile). Conflicts on close are held for the next interactive trigger.
+
+• Auto sync cooldown
+  Minimum seconds between auto-triggered syncs (book close, device wake, KOReader startup). Manual syncs and closing a *different* book always run regardless of the cooldown. Default 120 s. Set to 0 to disable the cooldown.
 
 HOW TO SET IT UP
 

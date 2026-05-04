@@ -11,7 +11,8 @@ Sync files from a WebDAV server to your device. Optional credentials, configurab
 - **Auto-sync books** – When enabled, book sync runs at KOReader startup and on wake-from-sleep (debounced).
 - **Manual sync** – Use **Sync books now** from the menu to pull all files at any time. The action is also exposed as `WebDAV sync books now` in the Dispatcher, so you can bind it to a gesture, profile, or reader-top toolbar button.
 - **Two-way book sync (optional)** – When enabled, book sync also uploads new or changed local files back to the server. Affects book sync only — reading-progress sync is always bidirectional. Uses a small state cache to detect what changed since the last sync, so re-runs only transfer files that actually moved. Conflicts (a file changed on both sides) surface as a per-file dialog at the next interactive moment (manual sync, startup, or wake) — silent triggers leave them pending. Deletions are never propagated.
-- **Auto-sync reading progress (optional, opt-in)** – When enabled, the plugin keeps each book's `.sdr` sidecar (last reading position, bookmarks, highlights, custom metadata, custom cover) in sync across devices via the same WebDAV server. Triggered automatically on book close (silent — pushes only the just-closed book, one network request), and on wake and KOReader startup (interactive, full library reconcile — pending conflicts surface as a dialog). All auto triggers share a 120-second cooldown to keep WebDAV load down, but closing a *different* book always runs anyway since each book's sidecar is independent. Also reachable manually via **Sync reading progress now** in the menu or the `WebDAV sync reading progress now` Dispatcher action (bind it to a gesture or toolbar slot). Requires KOReader's *Document → Metadata folder* to be set to *Book folder* (the default), since only that mode places sidecars next to books.
+- **Auto-sync reading progress (optional, opt-in)** – When enabled, the plugin keeps each book's `.sdr` sidecar (last reading position, bookmarks, highlights, custom metadata, custom cover) in sync across devices via the same WebDAV server. Triggered automatically on book close (silent — pushes only the just-closed book, one network request), and on wake and KOReader startup (interactive, full library reconcile — pending conflicts surface as a dialog). All auto triggers share a configurable cooldown (default 120 s, settable from the menu) to keep WebDAV load down, but closing a *different* book always runs anyway since each book's sidecar is independent. Also reachable manually via **Sync reading progress now** in the menu or the `WebDAV sync reading progress now` Dispatcher action (bind it to a gesture or toolbar slot). Requires KOReader's *Document → Metadata folder* to be set to *Book folder* (the default), since only that mode places sidecars next to books.
+- **Configurable auto-sync cooldown** – The minimum gap between auto-triggered syncs is exposed in the menu (**Auto sync cooldown**). Default 120 s, range 0–1800 s. Set to 0 to disable the cooldown entirely.
 
 ## How auto sync triggers work
 
@@ -22,11 +23,11 @@ flowchart TD
     Startup([KOReader startup])
     Manual([Menu / Dispatcher action])
 
-    Close --> CG{Same book<br/>closed within 120 s?}
+    Close --> CG{Same book<br/>closed within cooldown?}
     CG -- yes --> Skip([skip])
     CG -- no --> Scoped[Scoped progress sync<br/>1 PROPFIND on this book's .sdr/]
 
-    Resume --> AG{120 s since<br/>last auto run?}
+    Resume --> AG{Cooldown<br/>since last auto run?}
     Startup --> AG
     AG -- no --> Skip
     AG -- yes --> Full[Full progress reconcile<br/>+ chained book auto-sync]
@@ -47,9 +48,10 @@ flowchart TD
 **Reading the diagram:**
 
 - The four entry points on the left are the only things that ever start a sync. There is **no** sync triggered by Suspend or by reading position changes — only by the events shown.
-- **Close** is cheap (one network request, scoped to the just-closed book) and has its own per-book gate. Closing book A then book B fires twice; closing book A then book A again within 120 s only fires once.
+- **Close** is cheap (one network request, scoped to the just-closed book) and has its own per-book gate. Closing book A then book B fires twice; closing book A then book A again within the cooldown only fires once.
 - **Wake** and **Startup** share the global cooldown — they're the catch-up moments when full library reconciles happen and any held conflicts are surfaced.
 - **Manual** triggers always run, and they reset the cooldown so an auto trigger right after won't fire redundantly.
+- The cooldown defaults to **120 seconds** but is configurable from the menu (**Auto sync cooldown**). Set it to 0 to disable the cooldown entirely.
 - Conflicts produced by a silent close are stored without dialog and shown the next time an interactive trigger runs.
 
 ## Installation
@@ -68,9 +70,10 @@ flowchart TD
 6. **Auto-sync books** – Turn on to sync book files automatically when KOReader starts and when the device wakes from sleep.
 7. **Two-way book sync (upload local changes)** – Turn on to also push local changes back to the server. The very first run after enabling silently establishes a baseline of files already present on both sides (no transfers, no conflicts). Subsequent runs upload anything new or modified locally and download anything new or modified remotely. Applies only to book sync — progress sync is always bidirectional.
 8. **Auto-sync reading progress** – Turn on to keep `.sdr` sidecars in sync across devices automatically. Pushes happen on book close (one PROPFIND, scoped to that book); full reconcile and conflict prompts happen on wake and at startup.
-9. **Sync books now** – Run a full book-file sync manually (lists all files on the server, downloads matching ones into the chosen folder; with two-way on, also uploads local changes).
-10. **Sync reading progress now** – Reconcile `.sdr` sidecars on demand without waiting for an event trigger.
-11. **Help** – Open an in-app reference of what each menu item does and how to set it up.
+9. **Auto sync cooldown** – Adjust the minimum gap between auto-triggered syncs. Default 120 s. 0 disables the cooldown.
+10. **Sync books now** – Run a full book-file sync manually (lists all files on the server, downloads matching ones into the chosen folder; with two-way on, also uploads local changes).
+11. **Sync reading progress now** – Reconcile `.sdr` sidecars on demand without waiting for an event trigger.
+12. **Help** – Open an in-app reference of what each menu item does and how to set it up.
 
 Sync downloads **all files** under the server URL recursively; subfolders are recreated under the download folder.
 
