@@ -30,11 +30,12 @@ Upstream KOReader uses **luacheck**. This repo uses **selene** instead, because 
 Three Lua modules form a thin pipeline. Read them in this order to understand the flow:
 
 ```
-main.lua     UI/menu/settings (WidgetContainer subclass)
+main.lua     UI/menu/settings + lifecycle event handlers
+             (WidgetContainer subclass — file manager AND reader contexts).
    |
-   v   doSync({is_auto = ...})
-sync.lua     One-way: run_sync (list -> filter -> download).
-             Two-way: plan / do_action / save_cache.
+   v   doSync({is_auto = ...})        doProgressSync({manual,interactive})
+sync.lua     Books: run_sync (one-way) | plan / do_action / save_cache (two-way).
+             Progress: plan_progress (two-way over .sdr sidecars only).
    |
    v   uses
 webdav.lua   WebDAV client (PROPFIND list, GET download, PUT upload, MKCOL).
@@ -42,8 +43,14 @@ webdav.lua   WebDAV client (PROPFIND list, GET download, PUT upload, MKCOL).
 
 Non-obvious points across files:
 
-- **Settings namespace**: every setting is keyed `webdav_autosync_<name>` in `G_reader_settings`. The `getSetting`/`saveSetting` helpers in `main.lua` add the prefix automatically — call them, don't touch `G_reader_settings` directly except for the `webdav_autosync_enabled` and `webdav_autosync_two_way` toggle flags.
-- **Auto-sync runs at most once per KOReader session** and **only in File Manager context** (`not self.ui.document`). The guard is the module-local `auto_sync_started` in `main.lua`. Don't introduce a new `G_*` global for this — that's how it was before; it was deliberately removed.
+- **Settings namespace**: every setting is keyed `webdav_autosync_<name>` in `G_reader_settings`. The `getSetting`/`saveSetting` helpers in `main.lua` add the prefix automatically — call them, don't touch `G_reader_settings` directly except for the `webdav_autosync_enabled`, `webdav_autosync_two_way`, and `webdav_autosync_progress` toggle flags.
+- **Trigger taxonomy** — the plugin's automatic syncs (book and progress) are gated by two module-local time-debounce timestamps in `main.lua`: `book_sync_last_run` (60 s cool-down, used by `maybeRunBookAutoSync`) and `progress_sync_last_run` (30 s cool-down, used by `doProgressSync`). The earlier once-per-session boolean (`auto_sync_started`) was deliberately replaced when book sync gained a `Resume` trigger in addition to startup; do not reintroduce per-session booleans for either sync.
+- **Silent vs interactive triggers** — both syncs share the same rule:
+  - *Silent* (`onCloseDocument`, `onSuspend`): execute non-conflicting actions; conflicts are **deferred** (not resolved, not reported, not even cached as resolved). The next planner pass re-detects them.
+  - *Interactive* (`onResume`, plugin `init()` startup, manual menu/Dispatcher entry): execute non-conflicting actions, then chain `resolveConflictsInteractive` over any pending conflicts (Keep local / Keep remote / Skip).
+  - Auto interactive triggers (Resume, startup) silently no-op when offline; manual triggers prompt for Wi-Fi via the existing `ConfirmBox` path.
+  - Book auto-sync only fires from the *interactive* event set (init + Resume); book close and Suspend are progress-only.
+  - Book auto-sync is still **file-manager-only** (`not self.ui.document`) — running a full library scan from inside a reader context is disruptive. Progress sync runs in either context.
 - **`webdav.lua` mirrors KOReader's own `apps/cloudstorage/webdavapi.lua`**: trailing slash required for PROPFIND, minimal `<allprop/>` body, `user`/`password` go in the request table (not as an `Authorization: Basic …` header), timeouts use `socketutil:set_timeout()`. Diverging from this pattern has historically broken servers like Nextcloud — keep parity unless there's a strong reason not to.
 - **Recursion in `webdav.list_all`** issues one PROPFIND per directory with `Depth: 1`. The recursion's self-skip (`e_path_norm ~= url_path`) prevents the parent from re-listing itself; removing that check causes infinite recursion.
 - **Cloud storage import** (`importFromCloudStorage` in `main.lua`) handles two KOReader generations:
@@ -53,13 +60,21 @@ Non-obvious points across files:
   - The local download folder is **deliberately not** imported from upstream's `sync_dest_folder` — that's always user-chosen via "Choose download folder", since the cloud and local destinations are conceptually separate.
 - **Filename preservation**: WebDAV filenames are kept as-is locally. An earlier version renamed downloaded EPUBs to `<dc:title>.epub`, but that broke the existence check on re-syncs (re-downloading every time). The plugin now relies on filenames being usable as-shipped from the server; KOReader's file browser displays the book title from metadata regardless of filename.
 - **Two-way sync** (opt-in via the `webdav_autosync_two_way` toggle):
-  - State cache lives at `<settings_dir>/webdav_autosync_state.lua` via `LuaSettings`. Schema: `files = { [relpath] = { remote_etag, remote_mtime, local_mtime, local_size } }`. Updated in-memory after each successful action and flushed at end of sync; partial syncs leave a consistent partial cache.
+  - State cache lives at `<settings_dir>/webdav_autosync_state.lua` via `LuaSettings`. Schema: `files = { [relpath] = { remote_etag, remote_mtime, local_mtime, local_size } }`. Updated in-memory after each successful action and flushed at end of sync; partial syncs leave a consistent partial cache. Book and progress sync share this single cache — relpaths are disjoint by construction (`is_sidecar_path` = "any path segment ending in `.sdr`").
   - Change detection: remote-changed if etag or mtime differs from cache; local-changed if mtime or size differs. Both changed = conflict.
-  - **First two-way run after enabling baselines silently** any file that exists on both sides without a cache entry — no transfer, no conflict dialog. Avoids dialog spam on libraries previously synced one-way. Side effect: pre-existing local edits made before two-way was enabled are not preserved as a "changed" signal; if remote also changes, the local edit will be overwritten by the next download.
-  - **No-deletion policy**: if a file disappears on one side after being cached, the plugin neither re-creates it nor propagates the deletion. The cache entry is kept so subsequent runs continue to skip it.
-  - **Conflict UI**: manual sync chains a `ButtonDialogTitle` per conflict (Keep local / Keep remote / Skip). Dialogs are sequential — each pick triggers the next conflict's dialog, then the summary fires when the chain finishes. Auto sync skips conflicts silently and counts them in the summary. Don't try to do conflicts inside the synchronous `run_sync`/plan call — UI input requires the chained-callback approach in `resolveConflictsInteractive`.
-  - **Same extension filter applies in both directions**: only files matching `webdav_autosync_file_extensions` (or the default KOReader format list) are considered for either upload or download. Random non-book files in the download folder are not pushed.
+  - **First two-way run after enabling baselines silently** any file that exists on both sides without a cache entry — no transfer, no conflict dialog. Avoids dialog spam on libraries previously synced one-way. The same baseline rule applies to progress sync's first run. Side effect: pre-existing local edits made before two-way was enabled are not preserved as a "changed" signal.
+  - **No-deletion policy**: if a file disappears on one side after being cached, the plugin neither re-creates it nor propagates the deletion. The cache entry is kept so subsequent runs continue to skip it. Applies to both book and progress sync.
+  - **Conflict UI**: `resolveConflictsInteractive` chains a `ButtonDialogTitle` per conflict (Keep local / Keep remote / Skip). Dialogs are sequential — each pick triggers the next dialog, then the summary fires when the chain finishes. UI input requires this chained-callback approach because `do_action` is synchronous; do not attempt to surface conflicts inside the planner.
+  - **Conflict resolution policy is shared between book and progress sync**: silent triggers defer; interactive triggers run the dialog chain. The previous "auto silently skips conflicts and counts them in the summary" behavior was removed when the trigger taxonomy was introduced — auto runs from init() and Resume now go through the dialog chain because the user is present.
+  - **Same extension filter applies in both directions**: only files matching `webdav_autosync_file_extensions` (or the default KOReader format list) are considered for either upload or download. Random non-book files in the download folder are not pushed. Progress sync uses a separate filter (`is_sidecar_path`) and ignores the extension setting entirely.
   - **Upload path**: `webdav.upload_file` does PUT; `webdav.ensure_remote_dirs` walks parent path segments and MKCOLs each (treating 405 = already exists as success). PUT response ETag is captured when the server provides one; if absent, the next PROPFIND fills it in for subsequent change detection.
+
+- **Progress sync** (opt-in via the `webdav_autosync_progress` toggle, default off):
+  - Reuses the two-way machinery via `sync.plan_progress` (alongside `sync.plan`); `do_action`, `save_cache`, and `resolveConflictsInteractive` are shared with book sync without modification. The shared `diff_indices` helper in `sync.lua` is what makes that work — `plan` and `plan_progress` only differ in how they build the remote/local indices.
+  - **Triggered by**: `onCloseDocument` (silent), `onSuspend` (silent), `onResume` (interactive), `init()` (interactive). Plus the `webdav_progress_sync_now` Dispatcher action and the "Sync reading progress now" menu item, which are always interactive and bypass the debounce.
+  - **Sidecar location requirement**: only KOReader's default `document_metadata_folder = "doc"` is supported, since only that mode places `.sdr` directories inside the synced library tree. With `dir` or `hash` modes the sidecars are off-tree and have no remote mapping; silent triggers no-op (one debug log line), interactive manual triggers show an `InfoMessage` explaining the limit. Do not try to chase per-mode sidecar paths — the remote layout has no place for them.
+  - **Why we don't auto-resolve progress conflicts via mtime**: an earlier draft proposed mtime-wins on close/suspend so cross-device reading would be self-healing. We dropped it: the user wants conflicts surfaced explicitly at the next interactive moment. Don't reintroduce auto-resolve without explicit say-so.
+  - **`is_doc_only = false`** stays — without it, lifecycle events fired by the reader (`CloseDocument`, `Suspend`, `Resume`) wouldn't reach the plugin.
 
 ## Releases
 
@@ -74,5 +89,5 @@ The workflow guards against tag/version drift: the tag (without leading `v`) mus
 - `_meta.lua` returns the plugin manifest table (`name`, `fullname`, `description`).
 - `main.lua` returns a `WidgetContainer:extend{}` subclass with `name = "webdav_autosync"`.
 - Menu entries are registered via `self.ui.menu:registerToMainMenu(self)` plus `addToMainMenu(menu_items)`.
-- Dispatcher actions (e.g. `WebDAVSyncNow`) are registered in `init()` and dispatched to handlers named `on<Event>` (e.g. `onWebDAVSyncNow`).
+- Dispatcher actions (e.g. `WebDAVSyncNow`, `WebDAVProgressSyncNow`) are registered in `init()` and dispatched to handlers named `on<Event>` (e.g. `onWebDAVSyncNow`, `onWebDAVProgressSyncNow`). Lifecycle events (`CloseDocument`, `Suspend`, `Resume`) follow the same `on<Event>` convention but are broadcast by KOReader rather than dispatcher actions; their handlers must NOT return `true` (other plugins still need the event).
 - Indentation: 4 spaces. Function naming: `camelCase` for methods, `snake_case` for module-local helpers (matches KOReader upstream).

@@ -4,14 +4,20 @@ Sync logic.
 One-way mode (legacy `run_sync`): list remote, download files matching the
 extension filter, skip files that already exist locally.
 
-Two-way mode (`plan`/`do_action`/`save_cache`): diff remote tree, local
-folder, and a per-plugin cache to compute downloads, uploads, and conflicts.
-Caller drives execution and conflict resolution; the cache is updated after
-each successful action.
+Two-way mode for book files (`plan`/`do_action`/`save_cache`): diff remote
+tree, local folder, and a per-plugin cache to compute downloads, uploads,
+and conflicts. Caller drives execution and conflict resolution; the cache
+is updated after each successful action.
+
+Progress mode (`plan_progress`): same machinery as two-way, but the indices
+only contain `.sdr` sidecar files (reading position, bookmarks, highlights,
+custom metadata, custom cover). Used by the close/suspend/resume/startup
+event hooks in main.lua.
 
 The cache lives at <settings_dir>/webdav_autosync_state.lua via LuaSettings,
 keyed by relpath (file path under the download folder / under the server URL
-base) -> { remote_etag, remote_mtime, local_mtime, local_size }.
+base) -> { remote_etag, remote_mtime, local_mtime, local_size }. Book and
+sidecar relpaths share the same table; their key spaces never collide.
 --]]--
 
 local LuaSettings = require("luasettings")
@@ -82,9 +88,9 @@ local function rel_from_remote_path(path, base)
 end
 
 --- Recursively collect local files under `folder`. Returns table keyed by
---- relpath -> { path = absolute, mtime = number, size = number }. Honours
---- the extension filter so we only consider files we'd ever sync.
-local function walk_local_files(folder, extensions_set)
+--- relpath -> { path = absolute, mtime = number, size = number }. The
+--- predicate decides which entries to keep; it receives (entry_name, relpath).
+local function walk_local(folder, predicate)
     local lfs = load_lfs()
     local out = {}
     local function recurse(dir, prefix)
@@ -95,10 +101,10 @@ local function walk_local_files(folder, extensions_set)
                 local full = dir .. "/" .. entry
                 local attr = lfs.attributes(full)
                 if attr then
+                    local rel = prefix == "" and entry or (prefix .. "/" .. entry)
                     if attr.mode == "directory" then
-                        recurse(full, prefix == "" and entry or (prefix .. "/" .. entry))
-                    elseif attr.mode == "file" and extension_allowed(entry, extensions_set) then
-                        local rel = prefix == "" and entry or (prefix .. "/" .. entry)
+                        recurse(full, rel)
+                    elseif attr.mode == "file" and predicate(entry, rel) then
                         out[rel] = {
                             path = full,
                             mtime = attr.modification,
@@ -111,6 +117,26 @@ local function walk_local_files(folder, extensions_set)
     end
     recurse(folder:gsub("/+$", ""), "")
     return out
+end
+
+--- Honours the extension filter so we only consider files we'd ever sync as books.
+local function walk_local_files(folder, extensions_set)
+    return walk_local(folder, function(entry) return extension_allowed(entry, extensions_set) end)
+end
+
+--- True when any segment of `rel` is a `.sdr` directory; identifies sidecar
+--- payload files (metadata.<ext>.lua, custom_metadata.lua, custom cover) that
+--- live under `<book>.sdr/`.
+local function is_sidecar_path(rel)
+    for segment in rel:gmatch("[^/]+") do
+        if segment:match("%.sdr$") then return true end
+    end
+    return false
+end
+
+--- Collect every regular file inside any `*.sdr/` directory under `folder`.
+local function walk_local_sidecars(folder)
+    return walk_local(folder, function(_, rel) return is_sidecar_path(rel) end)
 end
 
 local function open_cache()
@@ -241,57 +267,12 @@ local function run_sync(server_url, username, password, local_folder, progress_c
     return count_ok, count_skipped, nil
 end
 
---- Plan a two-way sync. Diffs remote, local, and cache; classifies each
---- relpath into one of: download, upload, conflict, skipped (unchanged or
---- one-sided-deletion-respecting policy), baselined (silent first-encounter
---- bookkeeping). Returns a plan table the caller drives via do_action and
---- save_cache; on first run after enabling two-way, files present on both
---- sides without a cache entry are baselined silently rather than flagged
---- as conflicts (avoids dialog spam against an existing library).
-local function plan(server_url, username, password, local_folder, extensions_filter)
-    if not server_url or server_url == "" then
-        return nil, "Server URL is not set"
-    end
-    if not webdav.url_has_host(server_url) then
-        return nil, "Server URL has no host (e.g. use https://example.com/webdav)"
-    end
-    if not local_folder or local_folder == "" then
-        return nil, "Download folder is not set"
-    end
-    local_folder = local_folder:gsub("/+$", "")
-
-    local list, code, err = webdav.list_all(server_url, username, password)
-    if not list then
-        return nil, "List failed: " .. tostring(code) .. " " .. tostring(err)
-    end
-
-    local base = base_path_from_url(server_url)
-    local extensions_set = parse_extensions(extensions_filter)
-
-    -- Build remote index keyed by relpath (only files matching the filter).
-    local remote_index = {}
-    for _, e in ipairs(list) do
-        if not e.is_collection and extension_allowed(e.path or "", extensions_set) then
-            local rel = rel_from_remote_path(e.path, base)
-            if rel ~= "" then
-                local href_full = e.href_full or e.href
-                if not href_full:match("^https?://") then
-                    href_full = webdav.normalize_url(server_url):match("^(https?://[^/]+)") .. (href_full:gsub("^/+", "/"))
-                end
-                remote_index[rel] = {
-                    href = href_full,
-                    etag = e.etag,
-                    mtime = e.mtime,
-                }
-            end
-        end
-    end
-
-    local local_index = walk_local_files(local_folder, extensions_set)
-
-    local cache = open_cache()
-    local cache_files = load_cache_files(cache)
-
+--- Diff remote, local, and cache indices into action lists. Used by both
+--- `plan` (book-file two-way) and `plan_progress` (sidecar two-way) — they
+--- only differ in which files they include in the indices. Returns the
+--- actions table plus a flag indicating whether silent baselining touched
+--- the cache (so the caller can flush).
+local function diff_indices(remote_index, local_index, cache_files, server_url, local_folder)
     local actions = {
         to_download = {},
         to_upload = {},
@@ -344,7 +325,7 @@ local function plan(server_url, username, password, local_folder, extensions_fil
             end
         elseif r and l then
             if not c then
-                -- First encounter with two-way: silently baseline.
+                -- First encounter: silently baseline (no transfer, no conflict).
                 update_cache_entry(cache_files, rel, r, l)
                 cache_dirty = true
                 actions.baselined = actions.baselined + 1
@@ -381,6 +362,116 @@ local function plan(server_url, username, password, local_folder, extensions_fil
         end
         -- r and l both nil means a stale cache entry; we leave it (no harm).
     end
+
+    return actions, cache_dirty
+end
+
+--- Build a remote-resource index from a list_all result. `keep` decides which
+--- entries to include (called with the relpath). Returns table keyed by
+--- relpath -> { href, etag, mtime }.
+local function build_remote_index(list, server_url, keep)
+    local base = base_path_from_url(server_url)
+    local origin = webdav.normalize_url(server_url):match("^(https?://[^/]+)")
+    local index = {}
+    for _, e in ipairs(list) do
+        if not e.is_collection then
+            local rel = rel_from_remote_path(e.path or "", base)
+            if rel ~= "" and keep(rel, e) then
+                local href_full = e.href_full or e.href
+                if not href_full:match("^https?://") then
+                    href_full = origin .. (href_full:gsub("^/+", "/"))
+                end
+                index[rel] = {
+                    href = href_full,
+                    etag = e.etag,
+                    mtime = e.mtime,
+                }
+            end
+        end
+    end
+    return index
+end
+
+--- Validate inputs shared by plan / plan_progress. Returns local_folder
+--- (trimmed) on success, or nil + error string.
+local function validate_two_way_inputs(server_url, local_folder)
+    if not server_url or server_url == "" then
+        return nil, "Server URL is not set"
+    end
+    if not webdav.url_has_host(server_url) then
+        return nil, "Server URL has no host (e.g. use https://example.com/webdav)"
+    end
+    if not local_folder or local_folder == "" then
+        return nil, "Download folder is not set"
+    end
+    return local_folder:gsub("/+$", "")
+end
+
+--- Plan a two-way sync of book files (filtered by the extensions filter).
+--- See diff_indices for the action taxonomy. Returns a plan table the caller
+--- drives via do_action and save_cache, or nil + error message.
+local function plan(server_url, username, password, local_folder, extensions_filter)
+    local trimmed_folder, verr = validate_two_way_inputs(server_url, local_folder)
+    if not trimmed_folder then return nil, verr end
+    local_folder = trimmed_folder
+
+    local list, code, err = webdav.list_all(server_url, username, password)
+    if not list then
+        return nil, "List failed: " .. tostring(code) .. " " .. tostring(err)
+    end
+
+    local extensions_set = parse_extensions(extensions_filter)
+    local remote_index = build_remote_index(list, server_url, function(_, e)
+        return extension_allowed(e.path or "", extensions_set)
+    end)
+    local local_index = walk_local_files(local_folder, extensions_set)
+
+    local cache = open_cache()
+    local cache_files = load_cache_files(cache)
+
+    local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
+            server_url, local_folder)
+
+    if cache_dirty then
+        cache:saveSetting("files", cache_files)
+        cache:flush()
+    end
+
+    return {
+        server_url = server_url,
+        username = username,
+        password = password,
+        local_folder = local_folder,
+        cache = cache,
+        cache_files = cache_files,
+        actions = actions,
+    }
+end
+
+--- Plan a two-way sync of `.sdr` sidecar content (reading position, bookmarks,
+--- highlights, custom metadata, custom cover). Same shape as `plan`; only the
+--- file selection differs (sidecar paths, no extension filter). The cache is
+--- shared with `plan` — sidecar relpaths and book-file relpaths are disjoint.
+local function plan_progress(server_url, username, password, local_folder)
+    local trimmed_folder, verr = validate_two_way_inputs(server_url, local_folder)
+    if not trimmed_folder then return nil, verr end
+    local_folder = trimmed_folder
+
+    local list, code, err = webdav.list_all(server_url, username, password)
+    if not list then
+        return nil, "List failed: " .. tostring(code) .. " " .. tostring(err)
+    end
+
+    local remote_index = build_remote_index(list, server_url, function(rel)
+        return is_sidecar_path(rel)
+    end)
+    local local_index = walk_local_sidecars(local_folder)
+
+    local cache = open_cache()
+    local cache_files = load_cache_files(cache)
+
+    local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
+            server_url, local_folder)
 
     if cache_dirty then
         cache:saveSetting("files", cache_files)
@@ -438,6 +529,7 @@ end
 return {
     run_sync = run_sync,
     plan = plan,
+    plan_progress = plan_progress,
     do_action = do_action,
     save_cache = save_cache,
     KOREADER_DEFAULT_EXTENSIONS = KOREADER_DEFAULT_EXTENSIONS,

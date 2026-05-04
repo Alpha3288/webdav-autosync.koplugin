@@ -12,17 +12,31 @@ local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
+local logger = require("logger")
 local sync = require("sync")
 local T = require("ffi/util").template
 local _ = require("gettext")
 
 local WebDAVSync = WidgetContainer:extend{
     name = "webdav_autosync",
+    -- `is_doc_only = false` is deliberate: we need lifecycle events
+    -- (CloseDocument/Suspend/Resume) from the reader AND the file-manager
+    -- context for book auto-sync. KOReader instantiates the plugin once
+    -- per UI surface, so onSuspend/onResume fire on both instances; the
+    -- module-local debounce timestamps below are shared, so duplicate
+    -- broadcasts collapse into a single sync.
     is_doc_only = false,
 }
 
--- Guards against running auto-sync more than once per KOReader session.
-local auto_sync_started = false
+-- Time-debounce timestamps (epoch seconds). Module-local so they're shared
+-- across the FileManager and ReaderUI plugin instances — KOReader broadcasts
+-- Suspend/Resume to both, and we want at most one sync per cool-down window.
+-- Replaces the old once-per-session boolean so the same code path can fire
+-- from init(), onResume, and the lifecycle event handlers.
+local progress_sync_last_run = 0
+local book_sync_last_run = 0
+local PROGRESS_SYNC_COOLDOWN = 30
+local BOOK_SYNC_COOLDOWN = 60
 
 function WebDAVSync:init()
     Dispatcher:registerAction("webdav_sync_now", {
@@ -31,15 +45,25 @@ function WebDAVSync:init()
         title = _("WebDAV sync now"),
         general = true,
     })
+    Dispatcher:registerAction("webdav_progress_sync_now", {
+        category = "none",
+        event = "WebDAVProgressSyncNow",
+        title = _("WebDAV sync reading progress now"),
+        general = true,
+    })
     self.ui.menu:registerToMainMenu(self)
-    -- Run auto sync once at startup if enabled (only in file manager, not when opening a book)
-    if G_reader_settings and G_reader_settings:isTrue("webdav_autosync_enabled")
-            and not self.ui.document and not auto_sync_started then
-        auto_sync_started = true
-        UIManager:scheduleIn(2, function()
-            self:doSync({ is_auto = true })
-        end)
-    end
+    -- Startup is an interactive trigger: surface deferred conflicts via dialog.
+    -- Both helpers gate themselves (toggle off, no config, debounce, offline)
+    -- so the calls are safe even when nothing is configured yet. Chained via
+    -- on_done — progress first, then book — so the conflict dialog chains
+    -- never overlap on screen.
+    UIManager:scheduleIn(2, function()
+        self:doProgressSync({
+            trigger = "startup",
+            interactive = true,
+            on_done = function() self:maybeRunBookAutoSync() end,
+        })
+    end)
 end
 
 function WebDAVSync:addToMainMenu(menu_items)
@@ -51,6 +75,12 @@ function WebDAVSync:addToMainMenu(menu_items)
                 text = _("Sync now"),
                 callback = function()
                     self:doSync()
+                end,
+            },
+            {
+                text = _("Sync reading progress now"),
+                callback = function()
+                    self:doProgressSync({ manual = true })
                 end,
             },
             {
@@ -101,6 +131,17 @@ function WebDAVSync:addToMainMenu(menu_items)
                     G_reader_settings:saveSetting("webdav_autosync_two_way", not enabled)
                 end,
             },
+            {
+                text = _("Auto-sync reading progress"),
+                keep_menu_open = true,
+                checked_func = function()
+                    return G_reader_settings:isTrue("webdav_autosync_progress")
+                end,
+                callback = function()
+                    G_reader_settings:flipNilOrFalse("webdav_autosync_progress")
+                end,
+                help_text = _("When enabled, syncs .sdr sidecars (reading position, bookmarks, highlights) on book close, device sleep, wake, and KOReader startup. Conflicts are deferred to the next wake or startup. Off by default."),
+            },
         },
     }
 end
@@ -108,6 +149,34 @@ end
 function WebDAVSync:onWebDAVSyncNow()
     self:doSync()
     return true
+end
+
+function WebDAVSync:onWebDAVProgressSyncNow()
+    self:doProgressSync({ manual = true })
+    return true
+end
+
+-- Silent triggers: run progress sync without surfacing conflicts. Conflicting
+-- entries are left untouched (their cache rows are not updated), so they
+-- re-surface on the next interactive trigger.
+function WebDAVSync:onCloseDocument()
+    self:doProgressSync({ trigger = "close", interactive = false })
+end
+
+function WebDAVSync:onSuspend()
+    self:doProgressSync({ trigger = "suspend", interactive = false })
+end
+
+-- Resume: interactive for both syncs. The user is present, so conflicts pile
+-- up here as dialogs. We chain progress → book auto-sync via on_done so the
+-- two dialog chains can't end up stacked on screen at the same time; book
+-- sync starts only once progress sync has fully resolved its conflicts.
+function WebDAVSync:onResume()
+    self:doProgressSync({
+        trigger = "resume",
+        interactive = true,
+        on_done = function() self:maybeRunBookAutoSync() end,
+    })
 end
 
 function WebDAVSync:getSetting(key, default)
@@ -313,6 +382,9 @@ function WebDAVSync:doSync(opts)
 
     local NetworkMgr = require("ui/network/manager")
     if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
+        -- Auto triggers (startup, Resume) silently no-op when offline; only
+        -- manual entry points pop the Wi-Fi prompt.
+        if is_auto then return end
         UIManager:show(ConfirmBox:new{
             text = _("WiFi is not enabled. Turn on WiFi now?"),
             ok_text = _("Turn on WiFi"),
@@ -448,10 +520,7 @@ function WebDAVSync:runTwoWaySync(ctx)
         self:turnOffWifiIfRequested(ctx)
     end
 
-    if #conflicts == 0 or ctx.is_auto then
-        if ctx.is_auto then
-            stats.conflicts_skipped = #conflicts
-        end
+    if #conflicts == 0 then
         finish()
         return
     end
@@ -531,6 +600,229 @@ function WebDAVSync:turnOffWifiIfRequested(ctx)
     if NetworkMgr.turnOffWifi then
         NetworkMgr:turnOffWifi()
     end
+end
+
+--- Interactive book auto-sync trigger. Called from init() (startup) and
+--- onResume; both contexts have the user present, so conflicts surface as
+--- dialogs via the existing runTwoWaySync path. No `interactive` parameter
+--- is needed — runTwoWaySync now always pops the conflict dialog chain
+--- (the `is_auto` silent-skip branch was removed when this trigger was
+--- added). Replaces the old once-per-session boolean with a 60-second
+--- time-debounce so the same code can fire from multiple events.
+--- File-manager-only — a full library scan inside a reader context would
+--- be disruptive.
+function WebDAVSync:maybeRunBookAutoSync()
+    if not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_enabled")) then
+        return
+    end
+    if self.ui.document then return end
+
+    local now = os.time()
+    if now - book_sync_last_run < BOOK_SYNC_COOLDOWN then return end
+
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr.isOnline and not NetworkMgr:isOnline() then return end
+
+    book_sync_last_run = now
+    self:doSync({ is_auto = true })
+end
+
+--- Auto-sync `.sdr` sidecars (reading position, bookmarks, highlights).
+--- opts.manual = true:           manual entry (menu / Dispatcher action). Bypass
+---                                debounce, prompt for Wi-Fi, show summary.
+--- opts.interactive = true:      surface conflicts as dialogs at the end.
+--- Otherwise (close, suspend):   silent — execute non-conflicting actions only,
+---                                leave conflicts pending for the next
+---                                interactive trigger.
+--- opts.on_done: optional callback invoked once the runner is done with this
+---   trigger (every exit path: gated, no-op, completed, conflicts resolved).
+---   Used by onResume to chain progress sync → book auto-sync without their
+---   dialog chains overlapping in the UI stack.
+function WebDAVSync:doProgressSync(opts)
+    opts = opts or {}
+    local manual = opts.manual == true
+    -- `manual` already implies interactive — the explicit `or` keeps callers
+    -- like `{ manual = true }` from having to set both.
+    local interactive = manual or opts.interactive == true
+    local on_done = opts.on_done
+    local function done() if on_done then on_done() end end
+
+    if not manual and not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_progress")) then
+        return done()
+    end
+
+    -- Cheap config check first: skip remaining work entirely (incl. the
+    -- network probe below) on installs that aren't configured yet.
+    local server_url = self:getSetting("server_url", "")
+    local local_folder = self:getSetting("download_folder", "")
+    if type(server_url) ~= "string" then server_url = "" end
+    if type(local_folder) ~= "string" then local_folder = "" end
+    server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
+    if server_url == "" or local_folder == "" then
+        if manual then
+            UIManager:show(InfoMessage:new{
+                text = _("WebDAV server or download folder is not configured."),
+            })
+        end
+        return done()
+    end
+
+    -- Sidecars must live next to books for the relpath mapping to work; in
+    -- the `dir` and `hash` modes they're outside the synced library tree.
+    -- Lua precedence here: `(G_reader_settings and readSetting(...)) or "doc"`.
+    local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
+    if meta_mode ~= "doc" then
+        if manual then
+            UIManager:show(InfoMessage:new{
+                text = _("Reading-progress sync only works when KOReader's document-metadata folder is set to 'Book folder'."),
+            })
+        else
+            logger.dbg("webdav_autosync: progress sync skipped — metadata folder is " .. tostring(meta_mode))
+        end
+        return done()
+    end
+
+    local NetworkMgr = require("ui/network/manager")
+    if not manual then
+        local now = os.time()
+        if now - progress_sync_last_run < PROGRESS_SYNC_COOLDOWN then return done() end
+        if NetworkMgr.isOnline and not NetworkMgr:isOnline() then return done() end
+        progress_sync_last_run = now
+        self:runProgressSync({
+            server_url = server_url,
+            local_folder = local_folder,
+            interactive = interactive,
+            manual = false,
+            on_done = on_done,
+        })
+        return
+    end
+
+    if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
+        UIManager:show(ConfirmBox:new{
+            text = _("WiFi is not enabled. Turn on WiFi now?"),
+            ok_text = _("Turn on WiFi"),
+            ok_callback = function()
+                NetworkMgr:turnOnWifi(function()
+                    self:doProgressSync({ manual = true, on_done = on_done })
+                end)
+            end,
+            cancel_callback = done,
+        })
+        return
+    end
+
+    progress_sync_last_run = os.time()
+    self:runProgressSync({
+        server_url = server_url,
+        local_folder = local_folder,
+        interactive = true,
+        manual = true,
+        on_done = on_done,
+    })
+end
+
+function WebDAVSync:runProgressSync(opts)
+    local server_url = opts.server_url
+    local local_folder = opts.local_folder
+    local interactive = opts.interactive
+    local manual = opts.manual
+    local on_done = opts.on_done
+    local function done() if on_done then on_done() end end
+
+    local username = self:getSetting("username", "")
+    local password = self:getSetting("password", "")
+
+    local syncing_msg
+    if manual then
+        syncing_msg = InfoMessage:new{ text = _("Syncing reading progress…") }
+        UIManager:show(syncing_msg)
+        UIManager:forceRePaint()
+    end
+
+    local plan_obj, err = sync.plan_progress(server_url, username, password, local_folder)
+    if not plan_obj then
+        if syncing_msg then UIManager:close(syncing_msg) end
+        if manual then
+            UIManager:show(InfoMessage:new{
+                text = T(_("Progress sync failed: %1"), tostring(err)),
+            })
+        else
+            logger.dbg("webdav_autosync: progress plan failed: " .. tostring(err))
+        end
+        return done()
+    end
+
+    local stats = {
+        downloaded = 0,
+        uploaded = 0,
+        unchanged = plan_obj.actions.skipped_unchanged,
+        baselined = plan_obj.actions.baselined,
+        conflicts_skipped = 0,
+        failed = 0,
+        failures = {},
+    }
+
+    for _, a in ipairs(plan_obj.actions.to_download) do
+        local ok, msg = sync.do_action(plan_obj, "download", a)
+        if ok then
+            stats.downloaded = stats.downloaded + 1
+        else
+            stats.failed = stats.failed + 1
+            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
+        end
+    end
+    for _, a in ipairs(plan_obj.actions.to_upload) do
+        local ok, msg = sync.do_action(plan_obj, "upload", a)
+        if ok then
+            stats.uploaded = stats.uploaded + 1
+        else
+            stats.failed = stats.failed + 1
+            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
+        end
+    end
+
+    if syncing_msg then UIManager:close(syncing_msg) end
+
+    local conflicts = plan_obj.actions.conflicts
+    local function finish()
+        sync.save_cache(plan_obj)
+        if manual then self:showProgressSummary(stats) end
+        done()
+    end
+
+    -- Silent triggers leave conflicts pending: cache rows for conflicting
+    -- entries are not updated, so the next interactive planner pass re-detects
+    -- them and surfaces the dialog.
+    if not interactive or #conflicts == 0 then
+        finish()
+        return
+    end
+
+    self:resolveConflictsInteractive(plan_obj, conflicts, stats, finish)
+end
+
+function WebDAVSync:showProgressSummary(stats)
+    local parts = {}
+    table.insert(parts, T(_("%1 downloaded."), tostring(stats.downloaded)))
+    table.insert(parts, T(_("%1 uploaded."), tostring(stats.uploaded)))
+    if stats.unchanged > 0 then
+        table.insert(parts, T(_("%1 unchanged."), tostring(stats.unchanged)))
+    end
+    if stats.baselined > 0 then
+        table.insert(parts, T(_("%1 baselined."), tostring(stats.baselined)))
+    end
+    if stats.conflicts_skipped > 0 then
+        table.insert(parts, T(_("%1 conflicts skipped."), tostring(stats.conflicts_skipped)))
+    end
+    if stats.failed > 0 then
+        table.insert(parts, T(_("%1 failed."), tostring(stats.failed)))
+    end
+    local text = _("Reading progress synced.") .. " " .. table.concat(parts, " ")
+    if stats.failed > 0 and #stats.failures > 0 then
+        text = text .. "\n\n" .. table.concat(stats.failures, "\n")
+    end
+    UIManager:show(InfoMessage:new{ text = text })
 end
 
 return WebDAVSync
