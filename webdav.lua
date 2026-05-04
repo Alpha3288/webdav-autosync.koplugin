@@ -296,10 +296,28 @@ local function list_all(base_url, username, password)
             logger.dbg("webdav_autosync: list_all depth=infinity entries=" .. tostring(#all))
             return all
         end
-        if type(code) == "number" and code >= 400 and code < 600 then
+        if type(code) == "number" and code >= 400 and code < 500 then
+            -- 4xx is a hard refusal — config-level, won't change in this
+            -- process: 403 Forbidden, 501 Not Implemented (yes, 501 is 5xx
+            -- but it's also config-level — see below), 405 Method Not
+            -- Allowed, etc. Memo the host so subsequent syncs skip the
+            -- failed request.
             logger.info("webdav_autosync: list_all depth=infinity refused status=" .. tostring(code)
                 .. " host=" .. base_domain .. " — falling back to recursive Depth: 1")
             infinity_unsupported[base_domain] = true
+        elseif type(code) == "number" and code == 501 then
+            -- 501 Not Implemented is structurally a permanent refusal.
+            logger.info("webdav_autosync: list_all depth=infinity refused status=501 host="
+                .. base_domain .. " — falling back to recursive Depth: 1")
+            infinity_unsupported[base_domain] = true
+        elseif type(code) == "number" and code >= 500 and code < 600 then
+            -- Other 5xx (502, 503, 504, 507) is typically transient — overload,
+            -- maintenance window, quota throttling. Don't memo: a network blip
+            -- or a single 503 should not permanently disable the fast path
+            -- for the rest of the process. Recursive fallback will retry on
+            -- the next sync's first PROPFIND anyway.
+            logger.info("webdav_autosync: list_all depth=infinity transient status=" .. tostring(code)
+                .. " host=" .. base_domain .. " — trying recursive (will retry fast path next sync)")
         else
             -- Non-HTTP failure (timeout, DNS, auth string from socket layer).
             -- Don't memo — the recursive fallback will likely hit the same
