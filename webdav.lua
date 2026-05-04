@@ -62,8 +62,30 @@ local MONTHS = {
     Jul=7, Aug=8, Sep=9, Oct=10, Nov=11, Dec=12,
 }
 
---- Parse RFC 1123 HTTP-date ("Wed, 31 Oct 2025 12:34:56 GMT") to epoch seconds.
---- Result is in local-time epoch via os.time(); it's a stable comparison key, not a UTC value.
+--- Local-vs-UTC offset in seconds (positive west of GMT, e.g. +18000 in EST).
+--- Computed once at module load. KOReader's process is short-lived enough
+--- that DST transitions mid-process aren't a real concern.
+local function compute_tz_offset()
+    local now = os.time()
+    -- os.date("!*t", now) returns a table with UTC wall-clock components; passing
+    -- it to os.time interprets those components AS LOCAL TIME, so the result is
+    -- shifted from `now` by exactly the local TZ offset.
+    local utc_table = os.date("!*t", now)
+    if type(utc_table) ~= "table" then return 0 end
+    utc_table.isdst = false
+    local local_interpretation = os.time(utc_table)
+    if type(local_interpretation) ~= "number" then return 0 end
+    return math.floor(os.difftime(local_interpretation, now))
+end
+local TZ_OFFSET = compute_tz_offset()
+
+--- Parse RFC 1123 HTTP-date ("Wed, 31 Oct 2025 12:34:56 GMT") to UTC epoch
+--- seconds. The header is always GMT, but os.time interprets its argument as
+--- local time, so we subtract the local TZ offset to recover the true UTC
+--- epoch. Pre-v1.7.1 the result was a local-time epoch — stable enough for
+--- comparison at one device's fixed TZ, but a TZ change (travel) would shift
+--- every previously-cached remote_mtime by the delta and trigger a mass
+--- re-download on the next sync.
 local function parse_http_date(s)
     if not s or type(s) ~= "string" then return nil end
     local day, mon, year, hour, minute, sec = s:match("(%d+)%s+(%a+)%s+(%d+)%s+(%d+):(%d+):(%d+)")
@@ -73,8 +95,9 @@ local function parse_http_date(s)
     local ok, t = pcall(os.time, {
         year = tonumber(year), month = m, day = tonumber(day),
         hour = tonumber(hour), min = tonumber(minute), sec = tonumber(sec),
+        isdst = false,
     })
-    if ok then return t end
+    if ok and type(t) == "number" then return t - TZ_OFFSET end
     return nil
 end
 
