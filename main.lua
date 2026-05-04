@@ -96,6 +96,8 @@ function WebDAVSync:init()
         general = true,
     })
     self.ui.menu:registerToMainMenu(self)
+    local ui_kind = (self.ui and self.ui.document) and "reader" or "filemanager"
+    logger.dbg("webdav_autosync: init ui=" .. ui_kind)
     -- Startup is an interactive trigger: surface deferred conflicts via
     -- dialog. The runners gate themselves (toggle off, no config, offline)
     -- so the calls are safe even when nothing is configured yet. Chained
@@ -106,11 +108,19 @@ function WebDAVSync:init()
     -- Only schedule once per KOReader process — see the comment on
     -- startup_sync_scheduled above. Subsequent init() calls (from the
     -- FM↔Reader transition's fresh plugin instance) skip this block.
-    if startup_sync_scheduled then return end
+    if startup_sync_scheduled then
+        logger.dbg("webdav_autosync: init skip startup-sync (already scheduled this process) ui=" .. ui_kind)
+        return
+    end
     startup_sync_scheduled = true
+    logger.dbg("webdav_autosync: init scheduling startup sync in 2s ui=" .. ui_kind)
     UIManager:scheduleIn(2, function()
-        if not should_run_auto() then return end
+        if not should_run_auto() then
+            logger.dbg("webdav_autosync: trigger=startup skip reason=cooldown")
+            return
+        end
         mark_auto_run()
+        logger.info("webdav_autosync: trigger=startup")
         self:doProgressSync({
             trigger = "startup",
             interactive = true,
@@ -220,12 +230,14 @@ end
 
 function WebDAVSync:onWebDAVSyncNow()
     mark_auto_run()
+    logger.info("webdav_autosync: trigger=manual_books")
     self:doSync()
     return true
 end
 
 function WebDAVSync:onWebDAVProgressSyncNow()
     mark_auto_run()
+    logger.info("webdav_autosync: trigger=manual_progress")
     self:doProgressSync({ manual = true })
     return true
 end
@@ -237,21 +249,37 @@ end
 -- re-surface at the next interactive trigger (Resume or startup).
 function WebDAVSync:onCloseDocument()
     local doc = self.ui and self.ui.document
-    if not doc or not doc.file then return end
+    if not doc or not doc.file then
+        logger.dbg("webdav_autosync: trigger=close skip reason=no-document")
+        return
+    end
 
     local local_folder = self:getSetting("download_folder", "")
-    if type(local_folder) ~= "string" or local_folder == "" then return end
+    if type(local_folder) ~= "string" or local_folder == "" then
+        logger.dbg("webdav_autosync: trigger=close skip reason=no-download-folder")
+        return
+    end
     local trimmed = local_folder:gsub("/+$", "")
 
     -- Book opened from outside the synced library — no remote mapping; no-op.
     -- Don't fall back to a full-library walk on close, that defeats the
     -- whole reason this trigger is scoped.
-    if doc.file:sub(1, #trimmed + 1) ~= trimmed .. "/" then return end
+    if doc.file:sub(1, #trimmed + 1) ~= trimmed .. "/" then
+        logger.dbg("webdav_autosync: trigger=close skip reason=outside-library file=" .. tostring(doc.file))
+        return
+    end
     local book_rel = doc.file:sub(#trimmed + 2)
-    if book_rel == "" then return end
+    if book_rel == "" then
+        logger.dbg("webdav_autosync: trigger=close skip reason=empty-relpath")
+        return
+    end
 
-    if not should_run_close(book_rel) then return end
+    if not should_run_close(book_rel) then
+        logger.dbg("webdav_autosync: trigger=close skip reason=debounce book=" .. book_rel)
+        return
+    end
     mark_close_run(book_rel)
+    logger.info("webdav_autosync: trigger=close book=" .. book_rel)
     self:doProgressSyncForBook(book_rel)
 end
 
@@ -261,8 +289,12 @@ end
 -- sync starts only once progress sync has fully resolved its conflicts.
 -- Cooldown is consumed up here so the chain counts as a single auto slot.
 function WebDAVSync:onResume()
-    if not should_run_auto() then return end
+    if not should_run_auto() then
+        logger.dbg("webdav_autosync: trigger=resume skip reason=cooldown")
+        return
+    end
     mark_auto_run()
+    logger.info("webdav_autosync: trigger=resume")
     self:doProgressSync({
         trigger = "resume",
         interactive = true,
@@ -492,7 +524,10 @@ function WebDAVSync:doSync(opts)
     if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
         -- Auto triggers (startup, Resume) silently no-op when offline; only
         -- manual entry points pop the Wi-Fi prompt.
-        if is_auto then return end
+        if is_auto then
+            logger.dbg("webdav_autosync: book sync skip reason=offline (auto)")
+            return
+        end
         UIManager:show(ConfirmBox:new{
             text = _("WiFi is not enabled. Turn on WiFi now?"),
             ok_text = _("Turn on WiFi"),
@@ -547,8 +582,10 @@ function WebDAVSync:doSync(opts)
         turn_off_wifi = turn_off_wifi,
     }
     if two_way then
+        logger.info("webdav_autosync: book sync start mode=two_way is_auto=" .. tostring(is_auto == true))
         self:runTwoWaySync(ctx)
     else
+        logger.info("webdav_autosync: book sync start mode=one_way is_auto=" .. tostring(is_auto == true))
         self:runOneWaySync(ctx)
     end
 end
@@ -560,6 +597,9 @@ function WebDAVSync:runOneWaySync(ctx)
     local ok, skip, err, downloaded_rels = sync.run_sync(ctx.server_url, ctx.username, ctx.password,
             ctx.folder, nil, ctx.file_extensions)
     UIManager:close(syncing_msg)
+    logger.info(string.format(
+        "webdav_autosync: book sync done mode=one_way downloaded=%s skipped=%s failed=%s",
+        tostring(ok), tostring(skip), err and "yes" or "no"))
     if err then
         UIManager:show(InfoMessage:new{
             text = T(_("Sync failed: %1"), tostring(err)),
@@ -586,6 +626,7 @@ function WebDAVSync:runTwoWaySync(ctx)
             ctx.folder, ctx.file_extensions)
     if not plan_obj then
         UIManager:close(syncing_msg)
+        logger.warn("webdav_autosync: book sync plan failed: " .. tostring(err))
         UIManager:show(InfoMessage:new{
             text = T(_("Sync failed: %1"), tostring(err)),
         })
@@ -630,6 +671,10 @@ function WebDAVSync:runTwoWaySync(ctx)
     local function finish()
         sync.save_cache(plan_obj)
         self:notifyLibraryRefresh(plan_obj.local_folder, stats.downloaded_rels)
+        logger.info(string.format(
+            "webdav_autosync: book sync done mode=two_way downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
+            stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
+            stats.conflicts_skipped, stats.failed))
         self:showTwoWaySummary(stats)
         self:turnOffWifiIfRequested(ctx)
     end
@@ -639,6 +684,7 @@ function WebDAVSync:runTwoWaySync(ctx)
         return
     end
 
+    logger.info("webdav_autosync: book sync surfacing conflicts count=" .. tostring(#conflicts))
     self:resolveConflictsInteractive(plan_obj, conflicts, stats, finish)
 end
 
@@ -654,6 +700,7 @@ function WebDAVSync:resolveConflictsInteractive(plan_obj, conflicts, stats, on_d
         local function pick(action)
             UIManager:close(dialog)
             idx = idx + 1
+            logger.dbg("webdav_autosync: conflict resolution rel=" .. c.rel .. " choice=" .. action)
             if action == "skip" then
                 stats.conflicts_skipped = stats.conflicts_skipped + 1
                 next_one()
@@ -730,6 +777,10 @@ function WebDAVSync:notifyLibraryRefresh(local_folder, downloaded_rels)
         end
     end
 
+    local n = 0
+    for _ in pairs(seen) do n = n + 1 end
+    logger.dbg(string.format("webdav_autosync: notifyLibraryRefresh affected_books=%d total_rels=%d",
+            n, #downloaded_rels))
     UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
 end
 
@@ -775,12 +826,19 @@ end
 --- reader context would be disruptive.
 function WebDAVSync:maybeRunBookAutoSync()
     if not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_books_auto")) then
+        logger.dbg("webdav_autosync: book auto-sync skip reason=toggle-off")
         return
     end
-    if self.ui.document then return end
+    if self.ui.document then
+        logger.dbg("webdav_autosync: book auto-sync skip reason=reader-context")
+        return
+    end
 
     local NetworkMgr = require("ui/network/manager")
-    if NetworkMgr.isOnline and not NetworkMgr:isOnline() then return end
+    if NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+        logger.dbg("webdav_autosync: book auto-sync skip reason=offline")
+        return
+    end
 
     self:doSync({ is_auto = true })
 end
@@ -806,6 +864,7 @@ function WebDAVSync:doProgressSync(opts)
     local function done() if on_done then on_done() end end
 
     if not manual and not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_progress_auto")) then
+        logger.dbg("webdav_autosync: progress sync skip reason=toggle-off")
         return done()
     end
 
@@ -817,6 +876,7 @@ function WebDAVSync:doProgressSync(opts)
     if type(local_folder) ~= "string" then local_folder = "" end
     server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
     if server_url == "" or local_folder == "" then
+        logger.dbg("webdav_autosync: progress sync skip reason=not-configured")
         if manual then
             UIManager:show(InfoMessage:new{
                 text = _("WebDAV server or download folder is not configured."),
@@ -830,12 +890,11 @@ function WebDAVSync:doProgressSync(opts)
     -- Lua precedence here: `(G_reader_settings and readSetting(...)) or "doc"`.
     local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
     if meta_mode ~= "doc" then
+        logger.dbg("webdav_autosync: progress sync skip reason=metadata-folder-mode mode=" .. tostring(meta_mode))
         if manual then
             UIManager:show(InfoMessage:new{
                 text = _("Reading-progress sync only works when KOReader's document-metadata folder is set to 'Book folder'."),
             })
-        else
-            logger.dbg("webdav_autosync: progress sync skipped — metadata folder is " .. tostring(meta_mode))
         end
         return done()
     end
@@ -846,7 +905,10 @@ function WebDAVSync:doProgressSync(opts)
     -- Manual entry points bumped the cooldown timestamp at their own start.
     local NetworkMgr = require("ui/network/manager")
     if not manual then
-        if NetworkMgr.isOnline and not NetworkMgr:isOnline() then return done() end
+        if NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+            logger.dbg("webdav_autosync: progress sync skip reason=offline (auto)")
+            return done()
+        end
         self:runProgressSync({
             server_url = server_url,
             local_folder = local_folder,
@@ -886,12 +948,13 @@ end
 --- server/folder configured, online.
 function WebDAVSync:doProgressSyncForBook(book_rel)
     if not (G_reader_settings and G_reader_settings:isTrue("webdav_autosync_progress_auto")) then
+        logger.dbg("webdav_autosync: close-trigger sync skip reason=toggle-off book=" .. tostring(book_rel))
         return
     end
 
     local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
     if meta_mode ~= "doc" then
-        logger.dbg("webdav_autosync: close-trigger sync skipped — metadata folder is " .. tostring(meta_mode))
+        logger.dbg("webdav_autosync: close-trigger sync skip reason=metadata-folder-mode mode=" .. tostring(meta_mode))
         return
     end
 
@@ -900,29 +963,54 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
     if type(server_url) ~= "string" then server_url = "" end
     if type(local_folder) ~= "string" then local_folder = "" end
     server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
-    if server_url == "" or local_folder == "" then return end
-
-    local NetworkMgr = require("ui/network/manager")
-    if NetworkMgr.isOnline and not NetworkMgr:isOnline() then return end
-
-    local username = self:getSetting("username", "")
-    local password = self:getSetting("password", "")
-    local plan_obj, err = sync.plan_progress_book(server_url, username, password, local_folder, book_rel)
-    if not plan_obj then
-        logger.dbg("webdav_autosync: book progress plan failed: " .. tostring(err))
+    if server_url == "" or local_folder == "" then
+        logger.dbg("webdav_autosync: close-trigger sync skip reason=not-configured book=" .. tostring(book_rel))
         return
     end
 
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr.isOnline and not NetworkMgr:isOnline() then
+        logger.dbg("webdav_autosync: close-trigger sync skip reason=offline book=" .. tostring(book_rel))
+        return
+    end
+
+    local username = self:getSetting("username", "")
+    local password = self:getSetting("password", "")
+    logger.info("webdav_autosync: close-trigger sync start book=" .. tostring(book_rel))
+    local plan_obj, err = sync.plan_progress_book(server_url, username, password, local_folder, book_rel)
+    if not plan_obj then
+        logger.warn("webdav_autosync: close-trigger plan failed book=" .. tostring(book_rel) .. " err=" .. tostring(err))
+        return
+    end
+
+    local downloaded, uploaded, failed = 0, 0, 0
     local downloaded_rels = {}
     for _, a in ipairs(plan_obj.actions.to_download) do
-        local ok = sync.do_action(plan_obj, "download", a)
-        if ok then table.insert(downloaded_rels, a.rel) end
+        local ok, msg = sync.do_action(plan_obj, "download", a)
+        if ok then
+            downloaded = downloaded + 1
+            table.insert(downloaded_rels, a.rel)
+        else
+            failed = failed + 1
+            logger.warn("webdav_autosync: close-trigger download failed rel=" .. a.rel .. " err=" .. tostring(msg))
+        end
     end
     for _, a in ipairs(plan_obj.actions.to_upload) do
-        sync.do_action(plan_obj, "upload", a)
+        local ok, msg = sync.do_action(plan_obj, "upload", a)
+        if ok then
+            uploaded = uploaded + 1
+        else
+            failed = failed + 1
+            logger.warn("webdav_autosync: close-trigger upload failed rel=" .. a.rel .. " err=" .. tostring(msg))
+        end
     end
     sync.save_cache(plan_obj)
     self:notifyLibraryRefresh(plan_obj.local_folder, downloaded_rels)
+    logger.info(string.format(
+        "webdav_autosync: close-trigger sync done book=%s downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts=%d failed=%d",
+        tostring(book_rel), downloaded, uploaded,
+        plan_obj.actions.skipped_unchanged, plan_obj.actions.baselined,
+        #plan_obj.actions.conflicts, failed))
 end
 
 function WebDAVSync:runProgressSync(opts)
@@ -947,15 +1035,15 @@ function WebDAVSync:runProgressSync(opts)
         UIManager:forceRePaint()
     end
 
+    logger.info("webdav_autosync: progress sync start interactive=" .. tostring(interactive == true))
     local plan_obj, err = sync.plan_progress(server_url, username, password, local_folder)
     if not plan_obj then
         if syncing_msg then UIManager:close(syncing_msg) end
+        logger.warn("webdav_autosync: progress plan failed: " .. tostring(err))
         if interactive then
             UIManager:show(InfoMessage:new{
                 text = T(_("Progress sync failed: %1"), tostring(err)),
             })
-        else
-            logger.dbg("webdav_autosync: progress plan failed: " .. tostring(err))
         end
         return done()
     end
@@ -999,6 +1087,10 @@ function WebDAVSync:runProgressSync(opts)
     local function finish()
         sync.save_cache(plan_obj)
         self:notifyLibraryRefresh(plan_obj.local_folder, stats.downloaded_rels)
+        logger.info(string.format(
+            "webdav_autosync: progress sync done downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
+            stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
+            stats.conflicts_skipped, stats.failed))
         if interactive then self:showProgressSummary(stats) end
         done()
     end
@@ -1011,6 +1103,7 @@ function WebDAVSync:runProgressSync(opts)
         return
     end
 
+    logger.info("webdav_autosync: progress sync surfacing conflicts count=" .. tostring(#conflicts))
     self:resolveConflictsInteractive(plan_obj, conflicts, stats, finish)
 end
 

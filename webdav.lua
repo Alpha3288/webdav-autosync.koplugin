@@ -7,6 +7,7 @@ Matches KOReader's apps/cloudstorage/webdavapi.lua: socket.http, user/password i
 local ltn12 = require("ltn12")
 local socket = require("socket")
 local http = require("socket.http")
+local logger = require("logger")
 -- Use KOReader's socketutil for timeouts (same as WebDavApi)
 local socketutil
 local ok_su = pcall(function() socketutil = require("socketutil") end)
@@ -146,6 +147,7 @@ local function list_one(url, username, password, depth)
         user = (username and username ~= "") and username or nil,
         password = (password and password ~= "") and password or nil,
     }
+    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " depth=" .. tostring(depth))
     if socketutil and socketutil.set_timeout then
         socketutil:set_timeout()
     end
@@ -155,9 +157,12 @@ local function list_one(url, username, password, depth)
     end
     local body_str = table.concat(body)
     if type(code) ~= "number" or code < 200 or code > 299 then
+        logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " status=" .. tostring(code))
         return nil, code or status, body_str or tostring(status)
     end
-    return parse_propfind_response(body_str), code
+    local list = parse_propfind_response(body_str)
+    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " status=" .. tostring(code) .. " entries=" .. tostring(#list))
+    return list, code
 end
 
 --- Fetch a single resource's WebDAV properties (Depth: 0). Returns the first
@@ -266,6 +271,7 @@ local function download_file(remote_url, local_path, username, password)
     if socketutil and socketutil.reset_timeout then
         socketutil:reset_timeout()
     end
+    logger.dbg("webdav_autosync: GET url=" .. url .. " status=" .. tostring(code))
     if type(code) ~= "number" or code ~= 200 then
         return nil, "HTTP " .. tostring(code)
     end
@@ -312,6 +318,7 @@ local function mkcol(remote_url, username, password)
     if socketutil and socketutil.reset_timeout then
         socketutil:reset_timeout()
     end
+    logger.dbg("webdav_autosync: MKCOL url=" .. url .. " status=" .. tostring(code))
     if type(code) == "number" and (code == 201 or code == 405) then
         return true
     end
@@ -375,6 +382,7 @@ local function upload_file(remote_url, local_path, username, password)
     if socketutil and socketutil.reset_timeout then
         socketutil:reset_timeout()
     end
+    logger.dbg("webdav_autosync: PUT url=" .. url .. " size=" .. tostring(size) .. " status=" .. tostring(code))
     if type(code) ~= "number" or code < 200 or code > 299 then
         return nil, "HTTP " .. tostring(code)
     end

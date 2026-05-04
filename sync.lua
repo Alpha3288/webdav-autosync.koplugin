@@ -39,6 +39,26 @@ local function load_lfs()
     return require("lfs")
 end
 
+--- Count keys in a hash table. Used only for log output, not hot paths.
+local function count_keys(t)
+    local n = 0
+    for _ in pairs(t) do n = n + 1 end
+    return n
+end
+
+--- Emit the standard "plan complete" dbg line. Caller-supplied `name` tags
+--- which planner produced the numbers (`plan`, `plan_progress`,
+--- `plan_progress_book`) so multiple chained syncs can be distinguished.
+local function log_plan_summary(name, remote_index, local_index, actions)
+    logger.dbg(string.format(
+        "webdav_autosync: %s done remote=%d local=%d download=%d upload=%d conflicts=%d baselined=%d unchanged=%d remote_gone=%d local_gone=%d",
+        name,
+        count_keys(remote_index), count_keys(local_index),
+        #actions.to_download, #actions.to_upload, #actions.conflicts,
+        actions.baselined, actions.skipped_unchanged,
+        actions.skipped_remote_gone, actions.skipped_local_gone))
+end
+
 --- Parse extension filter string (comma/space separated) into lowercase set.
 --- Returns nil when str is nil or "" (meaning: use default KOReader formats).
 local function parse_extensions(str)
@@ -376,12 +396,14 @@ local function diff_indices(remote_index, local_index, cache_files, server_url, 
                 local lc = local_changed(l, c)
                 if lc then
                     logger.dbg(string.format(
-                        "webdav_autosync: local-changed rel=%s mtime cached=%s now=%s size cached=%s now=%s",
+                        "webdav_autosync: local-changed rel=%s mtime cached=%s now=%s size cached=%s now=%s hash cached=%s now=%s",
                         rel,
                         tostring(c.local_mtime), tostring(l.mtime),
-                        tostring(c.local_size), tostring(l.size)))
+                        tostring(c.local_size), tostring(l.size),
+                        tostring(c.local_hash), tostring(l.hash)))
                 end
                 if rc and lc then
+                    logger.dbg("webdav_autosync: diff rel=" .. rel .. " decision=conflict")
                     table.insert(actions.conflicts, {
                         rel = rel,
                         remote_url = r.href,
@@ -390,6 +412,7 @@ local function diff_indices(remote_index, local_index, cache_files, server_url, 
                         ["local"] = l,
                     })
                 elseif rc then
+                    logger.dbg("webdav_autosync: diff rel=" .. rel .. " decision=download reason=remote-changed")
                     table.insert(actions.to_download, {
                         rel = rel,
                         remote_url = r.href,
@@ -397,6 +420,7 @@ local function diff_indices(remote_index, local_index, cache_files, server_url, 
                         remote = r,
                     })
                 elseif lc then
+                    logger.dbg("webdav_autosync: diff rel=" .. rel .. " decision=upload reason=local-changed")
                     local remote_url = build_remote_url(server_url, rel)
                     table.insert(actions.to_upload, {
                         rel = rel,
@@ -480,6 +504,7 @@ local function plan(server_url, username, password, local_folder, extensions_fil
 
     local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
             server_url, local_folder)
+    log_plan_summary("plan", remote_index, local_index, actions)
 
     if cache_dirty then
         cache:saveSetting("files", cache_files)
@@ -562,6 +587,7 @@ local function plan_progress_book(server_url, username, password, local_folder, 
 
     local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
             server_url, local_folder)
+    log_plan_summary("plan_progress_book book=" .. tostring(book_rel), remote_index, local_index, actions)
 
     if cache_dirty then
         cache:saveSetting("files", cache_files)
@@ -603,6 +629,7 @@ local function plan_progress(server_url, username, password, local_folder)
 
     local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
             server_url, local_folder)
+    log_plan_summary("plan_progress", remote_index, local_index, actions)
 
     if cache_dirty then
         cache:saveSetting("files", cache_files)
@@ -625,17 +652,29 @@ end
 --- Returns true on success, or nil, error_message.
 local function do_action(p, kind, action)
     if kind == "download" then
+        logger.dbg("webdav_autosync: action=download rel=" .. action.rel)
         local ok, msg = webdav.download_file(action.remote_url, action.local_path, p.username, p.password)
-        if not ok then return nil, msg end
+        if not ok then
+            logger.dbg("webdav_autosync: action=download rel=" .. action.rel .. " result=fail msg=" .. tostring(msg))
+            return nil, msg
+        end
         local loc = stat_local(action.local_path)
         update_cache_entry(p.cache_files, action.rel, action.remote, loc)
+        logger.dbg("webdav_autosync: action=download rel=" .. action.rel .. " result=ok size=" .. tostring(loc and loc.size))
         return true
     elseif kind == "upload" then
+        logger.dbg("webdav_autosync: action=upload rel=" .. action.rel)
         -- Make sure parent collections exist on the server.
         local _, derr = webdav.ensure_remote_dirs(p.server_url, action.rel, p.username, p.password)
-        if derr then return nil, derr end
+        if derr then
+            logger.dbg("webdav_autosync: action=upload rel=" .. action.rel .. " result=fail-mkcol msg=" .. tostring(derr))
+            return nil, derr
+        end
         local ok, etag_from_put = webdav.upload_file(action.remote_url, action.local_path, p.username, p.password)
-        if not ok then return nil, etag_from_put end
+        if not ok then
+            logger.dbg("webdav_autosync: action=upload rel=" .. action.rel .. " result=fail-put msg=" .. tostring(etag_from_put))
+            return nil, etag_from_put
+        end
         -- Re-fetch props so cache reflects the server's post-PUT state. Without
         -- this, the next sync would see remote.mtime differ from cached
         -- remote_mtime and re-download the file we just uploaded.
@@ -646,6 +685,7 @@ local function do_action(p, kind, action)
         }
         local loc = stat_local(action.local_path) or action["local"]
         update_cache_entry(p.cache_files, action.rel, remote_after, loc)
+        logger.dbg("webdav_autosync: action=upload rel=" .. action.rel .. " result=ok size=" .. tostring(loc and loc.size) .. " etag=" .. tostring(remote_after.etag))
         return true
     end
     return nil, "unknown action"
@@ -655,6 +695,7 @@ local function save_cache(p)
     if not p or not p.cache then return end
     p.cache:saveSetting("files", p.cache_files)
     p.cache:flush()
+    logger.dbg("webdav_autosync: cache flushed rows=" .. tostring(count_keys(p.cache_files)))
 end
 
 return {
