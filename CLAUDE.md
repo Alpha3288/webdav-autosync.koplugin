@@ -57,6 +57,14 @@ Non-obvious points across files:
   - **Same extension filter applies in both directions**: only files matching `webdav_autosync_file_extensions` (or the default KOReader format list) are considered for either upload or download. Random non-book files in the download folder are not pushed.
   - **Upload path**: `webdav.upload_file` does PUT; `webdav.ensure_remote_dirs` walks parent path segments and MKCOLs each (treating 405 = already exists as success). PUT response ETag is captured when the server provides one; if absent, the next PROPFIND fills it in for subsequent change detection.
 
+## Releases
+
+A tag matching `v*` triggers `.github/workflows/release.yml`, which builds `webdav-autosync.koplugin-<tag>.zip` (containing the plugin folder with only the runtime files: `_meta.lua`, `main.lua`, `sync.lua`, `webdav.lua`, `LICENSE`, `README.md` — dev tooling like `Makefile`, `selene.toml`, `koreader.yml`, `.editorconfig`, `CLAUDE.md` is excluded) and publishes a GitHub Release with auto-generated notes.
+
+The workflow guards against tag/version drift: the tag (without leading `v`) must match `version` in `_meta.lua` or it fails fast. To cut a release: bump `_meta.lua` `version` first, commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+`appstore.koplugin` discovers this plugin via GitHub Search (it pulls the repo zipball at HEAD, not the release asset). Repo discoverability requires either the `koreader-plugin` GitHub topic on the repo, or a name matching `*.koplugin` (which this repo satisfies). Releases are still useful for users who download manually.
+
 ## KOReader plugin conventions this repo follows
 
 - `_meta.lua` returns the plugin manifest table (`name`, `fullname`, `description`).

@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify _meta.lua version matches tag
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          meta_version=$(grep -oE 'version *= *"[^"]+"' _meta.lua | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$tag_version" != "$meta_version" ]; then
+              echo "::error::tag is ${GITHUB_REF_NAME} (=> ${tag_version}) but _meta.lua version is ${meta_version}. Bump _meta.lua before tagging."
+              exit 1
+          fi
+
+      - name: Build plugin zip
+        id: build
+        run: |
+          set -euo pipefail
+          plugin_dir="webdav-autosync.koplugin"
+          zip_name="${plugin_dir}-${GITHUB_REF_NAME}.zip"
+          mkdir -p "build/${plugin_dir}"
+          cp _meta.lua main.lua sync.lua webdav.lua LICENSE README.md "build/${plugin_dir}/"
+          (cd build && zip -r "../${zip_name}" "${plugin_dir}")
+          echo "zip_name=${zip_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes \
+              "${{ steps.build.outputs.zip_name }}"
