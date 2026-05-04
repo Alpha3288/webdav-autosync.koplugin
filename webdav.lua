@@ -334,13 +334,12 @@ end
 --- the partial file as legitimate local content.
 local function download_file(remote_url, local_path, username, password)
     local url = url_encode(normalize_url(remote_url))
-    local lpath = local_path
-    local dir = lpath:match("^(.+)/[^/]+$")
+    local dir = local_path:match("^(.+)/[^/]+$")
     if dir then
         local ok_mp, mp_err = util.makePath(dir)
         if not ok_mp then return nil, mp_err end
     end
-    local f, ferr = io.open(lpath, "wb")
+    local f, ferr = io.open(local_path, "wb")
     if not f then return nil, ferr end
     local request = {
         url = url,
@@ -358,7 +357,7 @@ local function download_file(remote_url, local_path, username, password)
     end
     logger.dbg("webdav_autosync: GET url=" .. url .. " status=" .. tostring(code))
     if type(code) ~= "number" or code ~= 200 then
-        os.remove(lpath)
+        os.remove(local_path)
         return nil, "HTTP " .. tostring(code)
     end
     return true
@@ -413,16 +412,12 @@ end
 
 --- Upload a local file to WebDAV via PUT. Returns true, etag_or_nil on success,
 --- or nil, error_message on failure. Creates parent collections as needed.
+--- Caller must pass an absolute local_path; every in-tree caller does
+--- (the planner builds them as `local_folder .. "/" .. rel`, where
+--- local_folder comes from the user's PathChooser pick which is always
+--- absolute).
 local function upload_file(remote_url, local_path, username, password)
-    -- Resolve local path same way download_file does.
-    local lpath = local_path
-    if not lpath:match("^/") then
-        local ok_ds, DataStorage = pcall(require, "datastorage")
-        if ok_ds and DataStorage and DataStorage.getRealPath then
-            lpath = DataStorage:getRealPath(local_path)
-        end
-    end
-    local f, ferr = io.open(lpath, "rb")
+    local f, ferr = io.open(local_path, "rb")
     if not f then return nil, ferr end
     local size = f:seek("end") or 0
     f:seek("set", 0)

@@ -547,8 +547,8 @@ function WebDAVSync:setDownloadFolder()
         end
         if not initial_dir then
             local ok_ds, DataStorage = pcall(require, "datastorage")
-            if ok_ds and DataStorage and DataStorage.getRealPath then
-                initial_dir = DataStorage:getRealPath("") or nil
+            if ok_ds and DataStorage and DataStorage.getFullDataDir then
+                initial_dir = DataStorage:getFullDataDir() or nil
             end
         end
     end
