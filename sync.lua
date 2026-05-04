@@ -291,27 +291,31 @@ end
 
 --- Run a one-way sync (legacy behaviour). Lists remote, downloads anything
 --- matching the extension filter that doesn't already exist locally.
---- Returns: count_downloaded, count_skipped, error_message (nil on success),
---- downloaded_rels (list of relpaths actually written this run; empty when
---- everything was skipped or before the loop runs).
+--- Returns five values: count_downloaded, count_skipped, count_failed,
+--- error_message (nil on full success or when only setup-level errors hit),
+--- downloaded_rels (list of relpaths actually written this run).
+--- All three counts are always integers; the caller doesn't need to
+--- worry about which slot carries which number, the way it had to
+--- pre-v1.7.1 when the second return doubled as "skipped" or "failed"
+--- depending on whether anything failed.
 local function run_sync(server_url, username, password, local_folder, progress_cb, extensions_filter)
     if not server_url or type(server_url) ~= "string" then
-        return 0, 0, "Server URL is not set", {}
+        return 0, 0, 0, "Server URL is not set", {}
     end
     server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
     if server_url == "" then
-        return 0, 0, "Server URL is not set", {}
+        return 0, 0, 0, "Server URL is not set", {}
     end
     if not webdav.url_has_host(server_url) then
-        return 0, 0, "Server URL has no host (e.g. use https://example.com/webdav)", {}
+        return 0, 0, 0, "Server URL has no host (e.g. use https://example.com/webdav)", {}
     end
     if not local_folder or local_folder == "" then
-        return 0, 0, "Download folder is not set", {}
+        return 0, 0, 0, "Download folder is not set", {}
     end
     local_folder = local_folder:gsub("/+$", "")
     local list, code, err = webdav.list_all(server_url, username, password)
     if not list then
-        return 0, 0, "List failed: " .. tostring(code) .. " " .. tostring(err), {}
+        return 0, 0, 0, "List failed: " .. tostring(code) .. " " .. tostring(err), {}
     end
     local base = base_path_from_url(server_url)
     local extensions_set = parse_extensions(extensions_filter)
@@ -351,11 +355,11 @@ local function run_sync(server_url, username, password, local_folder, progress_c
             end
         end
     end
-    if (tonumber(count_fail) or 0) > 0 then
-        local error_msg = tostring(count_fail) .. " file(s) failed:\n" .. table.concat(failed_files, "\n")
-        return count_ok, count_fail, error_msg, downloaded_rels
+    local error_msg
+    if count_fail > 0 then
+        error_msg = tostring(count_fail) .. " file(s) failed:\n" .. table.concat(failed_files, "\n")
     end
-    return count_ok, count_skipped, nil, downloaded_rels
+    return count_ok, count_skipped, count_fail, error_msg, downloaded_rels
 end
 
 --- Diff remote, local, and cache indices into action lists. Used by both

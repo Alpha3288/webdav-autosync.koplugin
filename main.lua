@@ -706,25 +706,28 @@ function WebDAVSync:runOneWaySync(ctx)
     local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
     UIManager:show(syncing_msg)
     UIManager:forceRePaint()
-    local ok, skip, err, downloaded_rels = sync.run_sync(ctx.server_url, ctx.username, ctx.password,
+    local downloaded, skipped, failed, err, downloaded_rels = sync.run_sync(
+            ctx.server_url, ctx.username, ctx.password,
             ctx.folder, nil, ctx.file_extensions)
     UIManager:close(syncing_msg)
     logger.info(string.format(
-        "webdav_autosync: book sync done mode=one_way downloaded=%s skipped=%s failed=%s",
-        tostring(ok), tostring(skip), err and "yes" or "no"))
-    if err then
-        UIManager:show(InfoMessage:new{
-            text = T(_("Sync failed: %1"), tostring(err)),
-        })
-    else
-        local msg = T(_("Sync done. Downloaded %1 file(s)."), tostring(ok))
-        if (tonumber(skip) or 0) > 0 then
-            msg = msg .. " " .. T(_("%1 skipped (already exists)."), tostring(skip))
-        end
-        UIManager:show(InfoMessage:new{ text = msg })
+        "webdav_autosync: book sync done mode=one_way downloaded=%d skipped=%d failed=%d",
+        downloaded, skipped, failed))
+    -- Always show whatever counts we have, even on partial failure: a
+    -- run that downloaded 4 files and failed on 1 should still report
+    -- "4 downloaded" alongside the failure summary.
+    local parts = {}
+    table.insert(parts, T(_("Downloaded %1 file(s)."), tostring(downloaded)))
+    if skipped > 0 then
+        table.insert(parts, T(_("%1 skipped (already exists)."), tostring(skipped)))
     end
-    -- Even on partial failure (err set + count_fail returned), files that
-    -- did get written should still trigger a refresh.
+    if failed > 0 then
+        table.insert(parts, T(_("%1 failed."), tostring(failed)))
+    end
+    local text = _("Sync done.") .. " " .. table.concat(parts, " ")
+    if err then text = text .. "\n\n" .. tostring(err) end
+    UIManager:show(InfoMessage:new{ text = text })
+    -- Files that did get written still trigger a refresh, even when err is set.
     self:notifyLibraryRefresh(ctx.folder, downloaded_rels)
     self:turnOffWifiIfRequested(ctx)
 end
