@@ -182,7 +182,13 @@ local function list_one(url, username, password, depth)
     local body_str = table.concat(body)
     if type(code) ~= "number" or code < 200 or code > 299 then
         logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " status=" .. tostring(code))
-        return nil, code or status, body_str or tostring(status)
+        -- Truncate body for the error return: servers typically reply with
+        -- multi-KB HTML on 4xx/5xx, and the caller surfaces this string in
+        -- an InfoMessage popup. Keep the first 200 chars so the dialog stays
+        -- legible; full body is still available via the dbg log above.
+        local err_msg = body_str or tostring(status) or ""
+        if #err_msg > 200 then err_msg = err_msg:sub(1, 200) .. "…" end
+        return nil, code or status, err_msg
     end
     local list = parse_propfind_response(body_str)
     logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " status=" .. tostring(code) .. " entries=" .. tostring(#list))
