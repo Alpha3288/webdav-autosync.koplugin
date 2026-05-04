@@ -147,7 +147,6 @@ function WebDAVSync:init()
         if progress_on then
             self:doProgressSync({
                 trigger = "startup",
-                interactive = true,
                 on_done = function()
                     if books_on then self:maybeRunBookAutoSync() end
                 end,
@@ -404,7 +403,6 @@ function WebDAVSync:onResume()
     if progress_on then
         self:doProgressSync({
             trigger = "resume",
-            interactive = true,
             on_done = function()
                 if books_on then self:maybeRunBookAutoSync() end
             end,
@@ -954,23 +952,21 @@ function WebDAVSync:maybeRunBookAutoSync()
     self:doSync({ is_auto = true })
 end
 
---- Auto-sync `.sdr` sidecars (reading position, bookmarks, highlights).
---- opts.manual = true:           manual entry (menu / Dispatcher action). Bypass
----                                debounce, prompt for Wi-Fi, show summary.
---- opts.interactive = true:      surface conflicts as dialogs at the end.
---- Otherwise (close, suspend):   silent — execute non-conflicting actions only,
----                                leave conflicts pending for the next
----                                interactive trigger.
---- opts.on_done: optional callback invoked once the runner is done with this
----   trigger (every exit path: gated, no-op, completed, conflicts resolved).
----   Used by onResume to chain progress sync → book auto-sync without their
----   dialog chains overlapping in the UI stack.
+--- Full-library progress (`.sdr` sidecar) sync. Always interactive in the
+--- UI sense: shows a syncing message, surfaces failures, runs the conflict
+--- dialog chain, and shows a summary. The silent close trigger goes through
+--- doProgressSyncForBook instead.
+--- opts.manual = true:        manual entry (menu / Dispatcher action). Prompts
+---                            to enable Wi-Fi if needed; auto triggers
+---                            (init, Resume) silently no-op when offline.
+--- opts.on_done:              optional callback invoked once the runner is done
+---                            with this trigger (every exit path: gated, no-op,
+---                            completed, conflicts resolved). Used by onResume
+---                            to chain progress sync → book auto-sync without
+---                            their dialog chains overlapping in the UI stack.
 function WebDAVSync:doProgressSync(opts)
     opts = opts or {}
     local manual = opts.manual == true
-    -- `manual` already implies interactive — the explicit `or` keeps callers
-    -- like `{ manual = true }` from having to set both.
-    local interactive = manual or opts.interactive == true
     local on_done = opts.on_done
     local function done() if on_done then on_done() end end
 
@@ -1022,7 +1018,6 @@ function WebDAVSync:doProgressSync(opts)
         self:runProgressSync({
             server_url = server_url,
             local_folder = local_folder,
-            interactive = interactive,
             on_done = on_done,
         })
         return
@@ -1045,7 +1040,6 @@ function WebDAVSync:doProgressSync(opts)
     self:runProgressSync({
         server_url = server_url,
         local_folder = local_folder,
-        interactive = true,
         on_done = on_done,
     })
 end
@@ -1121,38 +1115,33 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
         #plan_obj.actions.conflicts, failed))
 end
 
+--- Run a full-library progress sync. Always interactive: shows the
+--- syncing InfoMessage, surfaces plan errors, runs the conflict dialog
+--- chain, and shows a summary at the end. Silent close-trigger syncs go
+--- through doProgressSyncForBook instead, so this path never needs a
+--- "silent" mode. All current entry points (init, onResume, manual menu,
+--- WebDAVProgressSyncNow Dispatcher action) reach here interactively.
 function WebDAVSync:runProgressSync(opts)
     local server_url = opts.server_url
     local local_folder = opts.local_folder
-    local interactive = opts.interactive
     local on_done = opts.on_done
     local function done() if on_done then on_done() end end
 
     local username = self:getSetting("username", "")
     local password = self:getSetting("password", "")
 
-    -- All three callers of runProgressSync (startup, Resume, manual) are
-    -- interactive — silent close-trigger syncs go through doProgressSyncForBook
-    -- instead. Show the syncing/summary/failure UI on every interactive run so
-    -- it matches book sync's behavior and silent plan errors don't disappear
-    -- into a debug log.
-    local syncing_msg
-    if interactive then
-        syncing_msg = InfoMessage:new{ text = _("Syncing reading progress…") }
-        UIManager:show(syncing_msg)
-        UIManager:forceRePaint()
-    end
+    local syncing_msg = InfoMessage:new{ text = _("Syncing reading progress…") }
+    UIManager:show(syncing_msg)
+    UIManager:forceRePaint()
 
-    logger.info("webdav_autosync: progress sync start interactive=" .. tostring(interactive == true))
+    logger.info("webdav_autosync: progress sync start")
     local plan_obj, err = sync.plan_progress(server_url, username, password, local_folder)
     if not plan_obj then
-        if syncing_msg then UIManager:close(syncing_msg) end
+        UIManager:close(syncing_msg)
         logger.warn("webdav_autosync: progress plan failed: " .. tostring(err))
-        if interactive then
-            UIManager:show(InfoMessage:new{
-                text = T(_("Progress sync failed: %1"), tostring(err)),
-            })
-        end
+        UIManager:show(InfoMessage:new{
+            text = T(_("Progress sync failed: %1"), tostring(err)),
+        })
         return done()
     end
 
@@ -1189,7 +1178,7 @@ function WebDAVSync:runProgressSync(opts)
         end
     end
 
-    if syncing_msg then UIManager:close(syncing_msg) end
+    UIManager:close(syncing_msg)
 
     local conflicts = plan_obj.actions.conflicts
     local function finish()
@@ -1199,14 +1188,11 @@ function WebDAVSync:runProgressSync(opts)
             "webdav_autosync: progress sync done downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
             stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
             stats.conflicts_skipped, stats.failed))
-        if interactive then self:showProgressSummary(stats) end
+        self:showProgressSummary(stats)
         done()
     end
 
-    -- Silent triggers leave conflicts pending: cache rows for conflicting
-    -- entries are not updated, so the next interactive planner pass re-detects
-    -- them and surfaces the dialog.
-    if not interactive or #conflicts == 0 then
+    if #conflicts == 0 then
         finish()
         return
     end
