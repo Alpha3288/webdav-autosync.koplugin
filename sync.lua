@@ -552,7 +552,15 @@ local function plan_progress_book(server_url, username, password, local_folder, 
     end
 
     local sdr_rel = sidecar_rel_for_book(book_rel)
-    local sdr_url = build_remote_url(server_url, sdr_rel)
+    -- Percent-encode before handing to list_one. Unlike download_file /
+    -- upload_file (which encode internally), list_one expects the URL
+    -- already on the wire — list_all's recursion has always passed the
+    -- server's encoded `href_raw` for that reason. Skipping the encode
+    -- here meant titles with spaces or other reserved chars produced
+    -- 400 Bad Request from strict WebDAV servers. Same root cause as
+    -- v1.4.1's list_all fix; surfaced here once the close trigger
+    -- started using list_one with our own constructed URL.
+    local sdr_url = webdav.url_encode(build_remote_url(server_url, sdr_rel))
 
     -- Single PROPFIND, depth 1. 404 means "no remote sidecar yet" —
     -- treat as an empty remote so a fresh book's first close uploads

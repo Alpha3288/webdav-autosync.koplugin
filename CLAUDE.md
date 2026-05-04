@@ -16,6 +16,15 @@ make parse    # LuaJIT parse-check every .lua file
 
 There are no tests. Local validation = static checks; behavioral testing requires installing the plugin into a KOReader instance.
 
+## Coding conventions (project-specific)
+
+These are user-set rules; follow them in source files (`*.lua`) and in user-facing strings:
+
+- **No vendor / WebDAV-provider names in code or code comments.** Use generic phrasing — "strict WebDAV servers", "some WebDAV servers", "the server" — instead of naming Koofr, Nextcloud, ownCloud, etc. Vendor-specific symptoms can be described generically (e.g. "returns 400 Bad Request on unencoded reserved characters"). CLAUDE.md and commit messages are the place for vendor names when context demands them.
+- **No real book titles, file names, or library contents in code or code comments.** When an example path or relpath helps explain something, use a generic placeholder (`<book>.epub`, `Some Book.sdr/metadata.epub.lua`, `BookA.epub`). Same applies to test fixtures, debug log examples in comments, and `_meta.lua` description strings.
+
+Both rules also apply to anything you write into CLAUDE.md prose where it would otherwise leak a specific user's setup. Use generic phrasing first; only when discussing prior incidents or release history is naming the offending vendor / dataset acceptable, and only in CLAUDE.md, not in source.
+
 ## Linter setup is non-standard — read before editing config
 
 Upstream KOReader uses **luacheck**. This repo uses **selene** instead, because luacheck was unworkable on the dev machine (Arch with Lua 5.5, missing `argparse`/`lfs`). The two configs are not interchangeable:
@@ -65,6 +74,7 @@ Non-obvious points across files:
   - Recursion URLs use `e.href_raw` (the wire-format, percent-encoded href as the server returned it), **not** the decoded `e.href`. Some servers (Koofr's HTTP frontend in particular) return 400 Bad Request when handed a request URL containing literal spaces or other unescaped reserved characters — which is exactly what happened pre-v1.4.1, since `parse_propfind_response` decoded the href before recursion. The bug went undiagnosed for months because the v1.3.0/v1.4.0 work mistakenly attributed the symptom to rate limiting; the actual fix is to keep the encoded href on the wire.
   - The self-skip comparison decodes `url_path` before comparing against the (decoded) `e.path`. Since the recursion now passes encoded URLs back into `list_one`, the request URL's path retains `%xx` escapes; without the decode step the self-skip would never match its own entry, the parent would re-list itself, and infinite recursion would only be averted by an eventual server error.
   - External consumers of `list_all` results (`download_file`, `upload_file`) keep using `e.href_full` (decoded) and re-encode via `url_encode` — that path is unchanged.
+  - **Encoding contract** (post-v1.5.4) — `download_file`, `upload_file`, `mkcol`, and `get_props` all accept **decoded** URLs and call `url_encode(normalize_url(...))` internally. `list_one` is the **single exception**: it accepts an already-encoded URL because `list_all`'s recursion has to feed it pre-encoded `href_raw` (see above) and re-encoding inside `list_one` would double-encode the `%`. Any caller that hands `list_one` a URL it constructed itself (e.g. `build_remote_url(...)` output, which is decoded) must wrap it in `webdav.url_encode(...)` — `plan_progress_book` does exactly that. v1.5.4 fixed two symptoms of this: the close trigger's `list_one` call 400'd on whitespace in book titles, and `get_props` had been silently 400'ing on any filename with reserved chars since forever (cache row got `etag_from_put` but no `remote_mtime` — benign because etag suffices for change detection, but a real broken path that hid behind the etag fallback). `webdav.url_encode` is exported from `webdav.lua` for the `list_one` case and for any future external need.
 - **Cloud storage import** (`importFromCloudStorage` in `main.lua`) handles two KOReader generations:
   - Pre-2026.03: `plugins/cloudstorage.koplugin/` exists and registers an instance on `self.ui.cloudstorage`. Call `cs:onShowCloudStorageList(callback)`; KOReader shows its own picker (server selection + folder navigation inside the server). Same pattern statistics/vocabbuilder used to follow.
   - 2026.03+: the cloudstorage plugin was deleted from KOReader. `self.ui.cloudstorage` is permanently nil. Upstream plugins migrated to `SyncService` (`require("frontend/apps/cloudstorage/syncservice")`); we do the same — `picker = SyncService:new{}; picker.onConfirm = handler; UIManager:show(picker)`.

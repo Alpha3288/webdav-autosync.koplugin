@@ -176,6 +176,14 @@ local function get_props(url, username, password)
     if not url_has_host(url) then
         return nil, "host or service not provided, or not known"
     end
+    -- Encode internally like download_file / upload_file / mkcol do — caller
+    -- passes a decoded URL (e.g. build_remote_url output, or an action's
+    -- remote_url). Only list_one keeps the encoded-URL contract because
+    -- list_all's recursion feeds it pre-encoded `href_raw`. Pre-v1.5.4 the
+    -- missing encode here meant the post-PUT property re-fetch silently
+    -- 400'd on any filename containing spaces or other reserved chars; the
+    -- cache then carried `etag_from_put` but no `remote_mtime`.
+    url = url_encode(url)
     local body = {}
     local request = {
         url = url,
@@ -190,6 +198,7 @@ local function get_props(url, username, password)
         user = (username and username ~= "") and username or nil,
         password = (password and password ~= "") and password or nil,
     }
+    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " depth=0")
     if socketutil and socketutil.set_timeout then
         socketutil:set_timeout()
     end
@@ -198,9 +207,11 @@ local function get_props(url, username, password)
         socketutil:reset_timeout()
     end
     if type(code) ~= "number" or code < 200 or code > 299 then
+        logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " depth=0 status=" .. tostring(code))
         return nil, code or status
     end
     local list = parse_propfind_response(table.concat(body))
+    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " depth=0 status=" .. tostring(code) .. " entries=" .. tostring(#list))
     return list[1]
 end
 
@@ -394,6 +405,7 @@ end
 return {
     normalize_url = normalize_url,
     url_has_host = url_has_host,
+    url_encode = url_encode,
     list_one = list_one,
     list_all = list_all,
     download_file = download_file,
