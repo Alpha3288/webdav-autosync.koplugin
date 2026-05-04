@@ -45,6 +45,7 @@ end
 function WebDAVSync:addToMainMenu(menu_items)
     menu_items.webdav_sync = {
         text = _("WebDAV Sync"),
+        sorting_hint = "tools",
         sub_item_table = {
             {
                 text = _("Sync now"),
