@@ -134,9 +134,18 @@ local function is_sidecar_path(rel)
     return false
 end
 
---- Collect every regular file inside any `*.sdr/` directory under `folder`.
+--- Sidecar paths the plugin will actually sync. Excludes KOReader's `.old`
+--- backup copies (e.g. `metadata.epub.lua.old`) — those are local
+--- write-ahead snapshots, not progress state, and round-tripping them just
+--- doubles every transfer for no benefit.
+local function is_syncable_sidecar(rel)
+    return is_sidecar_path(rel) and not rel:match("%.old$")
+end
+
+--- Collect every regular file inside any `*.sdr/` directory under `folder`,
+--- minus `.old` backup files.
 local function walk_local_sidecars(folder)
-    return walk_local(folder, function(_, rel) return is_sidecar_path(rel) end)
+    return walk_local(folder, function(_, rel) return is_syncable_sidecar(rel) end)
 end
 
 local function open_cache()
@@ -463,7 +472,7 @@ local function plan_progress(server_url, username, password, local_folder)
     end
 
     local remote_index = build_remote_index(list, server_url, function(rel)
-        return is_sidecar_path(rel)
+        return is_syncable_sidecar(rel)
     end)
     local local_index = walk_local_sidecars(local_folder)
 
