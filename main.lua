@@ -17,6 +17,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local logger = require("logger")
 local sync = require("sync")
+local webdav = require("webdav")
 local T = require("ffi/util").template
 local _ = require("gettext")
 
@@ -453,6 +454,20 @@ function WebDAVSync:setWebDAVServer()
                         local a = (fields and fields[1]) and tostring(fields[1]) or ""
                         local u = (fields and fields[2]) and tostring(fields[2]) or ""
                         local p = (fields and fields[3]) and tostring(fields[3]) or ""
+                        a = a:gsub("^%s+", ""):gsub("%s+$", "")
+                        -- Reject typo'd URLs at save time so subsequent syncs
+                        -- don't fail with a cryptic "Server URL has no host"
+                        -- popup. Empty leaves the existing URL untouched (user
+                        -- editing only credentials). Non-empty must parse to
+                        -- something with a host — webdav.url_has_host runs the
+                        -- same normalize_url(...) the sync paths use, so what
+                        -- passes here is what they accept.
+                        if a ~= "" and not webdav.url_has_host(a) then
+                            UIManager:show(InfoMessage:new{
+                                text = _("Server URL must include a host (e.g. https://example.com/webdav)."),
+                            })
+                            return
+                        end
                         if a ~= "" then plugin:saveSetting("server_url", a) end
                         plugin:saveSetting("username", u)
                         plugin:saveSetting("password", p)
