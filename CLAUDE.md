@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A KOReader plugin (`.koplugin` directory) that syncs files from a WebDAV server to a local folder. Loaded by KOReader at runtime; **cannot be executed standalone** — it `require`s KOReader-only modules (`dispatcher`, `ui/widget/*`, `socketutil`, `ffi/zip`, `ui/network/manager`).
+A KOReader plugin (`.koplugin` directory) that syncs files from a WebDAV server to a local folder. Loaded by KOReader at runtime; **cannot be executed standalone** — it `require`s KOReader-only modules (`dispatcher`, `ui/widget/*`, `socketutil`, `ui/network/manager`).
 
 ## Development commands
 
@@ -27,17 +27,16 @@ Upstream KOReader uses **luacheck**. This repo uses **selene** instead, because 
 
 ## Module architecture
 
-Four Lua modules form a thin pipeline. Read them in this order to understand the flow:
+Three Lua modules form a thin pipeline. Read them in this order to understand the flow:
 
 ```
-main.lua          UI/menu/settings (WidgetContainer subclass)
+main.lua     UI/menu/settings (WidgetContainer subclass)
    |
    v   doSync()
-sync.lua          Orchestrator: list -> filter -> download -> rename
+sync.lua     Orchestrator: list -> filter -> download
    |
    v   uses
-webdav.lua        WebDAV client (PROPFIND for listing, GET for download)
-epub_metadata.lua EPUB title extraction (used to rename downloaded .epub files)
+webdav.lua   WebDAV client (PROPFIND for listing, GET for download)
 ```
 
 Non-obvious points across files:
@@ -46,11 +45,7 @@ Non-obvious points across files:
 - **Auto-sync runs at most once per KOReader session** and **only in File Manager context** (`not self.ui.document`). The guard is the module-local `auto_sync_started` in `main.lua`. Don't introduce a new `G_*` global for this — that's how it was before; it was deliberately removed.
 - **`webdav.lua` mirrors KOReader's own `apps/cloudstorage/webdavapi.lua`**: trailing slash required for PROPFIND, minimal `<allprop/>` body, `user`/`password` go in the request table (not as an `Authorization: Basic …` header), timeouts use `socketutil:set_timeout()`. Diverging from this pattern has historically broken servers like Nextcloud — keep parity unless there's a strong reason not to.
 - **Recursion in `webdav.list_all`** issues one PROPFIND per directory with `Depth: 1`. The recursion's self-skip (`e_path_norm ~= url_path`) prevents the parent from re-listing itself; removing that check causes infinite recursion.
-- **EPUB rename after download** is best-effort: `os.rename` first, ZIP-style fallback (open/read/write/remove) if rename fails across filesystems. The `extract_title` flow opens `META-INF/container.xml`, reads the rootfile path, then parses `<dc:title>` from the OPF.
-
-## Known behavioral issue (not yet fixed)
-
-In `sync.lua`, files are skipped when they exist locally — but the existence check uses the original WebDAV filename, while EPUBs are then *renamed* to `<title>.epub`. So renamed EPUBs get re-downloaded on every sync. Either skip the rename, or change the existence check to also look for the title-renamed variant. Flag this if a user reports redundant downloads.
+- **Filename preservation**: WebDAV filenames are kept as-is locally. An earlier version renamed downloaded EPUBs to `<dc:title>.epub`, but that broke the existence check on re-syncs (re-downloading every time). The plugin now relies on filenames being usable as-shipped from the server; KOReader's file browser displays the book title from metadata regardless of filename.
 
 ## KOReader plugin conventions this repo follows
 

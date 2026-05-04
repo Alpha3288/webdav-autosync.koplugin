@@ -3,7 +3,6 @@ Sync logic: list all files from WebDAV and download to local folder.
 --]]--
 
 local webdav = require("webdav")
-local epub_metadata = require("epub_metadata")
 
 
 --- File extensions KOReader supports (default when user leaves filter empty).
@@ -115,31 +114,6 @@ local function run_sync(server_url, username, password, local_folder, progress_c
             local ok, msg = webdav.download_file(remote_url, local_path, username, password)
             if ok then
                 count_ok = count_ok + 1
-
-                -- For EPUB files, try to rename based on metadata title
-                local ext = local_path:match("%.([^%.]+)$")
-                if ext and ext:lower() == "epub" then
-                    local title = epub_metadata.extract_title(local_path)
-                    if title and title ~= "" then
-                        -- Build new path with title as filename
-                        local dir = local_path:match("^(.+)/[^/]+$") or local_folder
-                        local new_path = dir .. "/" .. title .. ".epub"
-
-                        -- Rename file (this will overwrite if duplicate exists)
-                        local rename_ok = os.rename(local_path, new_path)
-                        if not rename_ok then
-                            -- If rename fails, try using io operations
-                            local old_f = io.open(local_path, "rb")
-                            local new_f = io.open(new_path, "wb")
-                            if old_f and new_f then
-                                new_f:write(old_f:read("*a"))
-                                old_f:close()
-                                new_f:close()
-                                os.remove(local_path)
-                            end
-                        end
-                    end
-                end
             else
                 count_fail = count_fail + 1
                 -- Get just the filename for cleaner error messages
