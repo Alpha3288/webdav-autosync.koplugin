@@ -33,12 +33,12 @@ local WebDAVSync = WidgetContainer:extend{
 }
 
 -- Two independent cooldowns:
---   * auto_sync_last_run / get_cooldown() — full-library reconciles (Resume,
---     startup, and the chained book auto-sync). The expensive case the
---     cooldown was originally for; default 300 s.
---   * close_sync_last_run / get_close_cooldown() — the scoped close trigger
---     (one PROPFIND on the just-closed book's `.sdr/`). Cheap enough that it
---     deserves a much shorter knob; default 30 s.
+--   * full-reconcile  — gated by `webdav_autosync_last_auto_run_at` +
+--     `get_cooldown()`. Covers Resume, startup, and the chained book
+--     auto-sync. Default 300 s.
+--   * close-trigger   — gated by `webdav_autosync_last_close_run_at` +
+--     `get_close_cooldown()`. Covers the scoped close trigger (one
+--     PROPFIND on the just-closed book's `.sdr/`). Default 30 s.
 --
 -- The two timestamps are independent: a close-triggered sync does NOT push
 -- back the next full reconcile, and a Resume/startup sync does NOT push back
@@ -46,23 +46,42 @@ local WebDAVSync = WidgetContainer:extend{
 -- redundancy case (same book closed twice in quick succession; multiple
 -- wakes in quick succession) without one suppressing the other.
 --
--- Module-local so the timestamps are shared across the FileManager and
--- ReaderUI plugin instances — KOReader broadcasts Resume to both, and we
--- want at most one sync per cool-down window.
+-- Both timestamps (and the close-trigger's `last_close_book_rel` carve-out)
+-- live in the plugin's state file `<settings_dir>/webdav_autosync_state.lua`
+-- under their own keys, alongside the per-file `files` table the planners
+-- use. Pre-v1.7.3 they were module-local Lua values that defaulted to 0 on
+-- every process start, which made the *startup* trigger always pass
+-- `should_run_auto()` regardless of how recently the previous KOReader
+-- session had synced — exactly the "two startups in quick succession" case
+-- the cooldown is supposed to catch. The same was true for the close
+-- timestamp and `last_close_book_rel` (close-then-restart-then-close-of-
+-- same-book bypassed the carve-out). Persisting fixes all three.
 --
--- last_close_book_rel carves out the per-book exception for the close trigger:
--- closing a *different* book hits a different `.sdr/`, so it's not redundant
--- with the prior sync and is allowed regardless of the close cooldown.
--- Closing the *same* book within the cooldown is the redundant case we skip.
-local auto_sync_last_run = 0
-local close_sync_last_run = 0
-local last_close_book_rel = nil
+-- Why the state file and not `G_reader_settings`: these are sync-state
+-- runtime values, not user configuration. Wiping the state file (e.g. to
+-- force a fresh baseline) should reset the cooldowns too — that's what
+-- happens automatically when they live alongside the per-file cache rows.
+-- The cost is one extra explicit flush per `mark_*_run` (G_reader_settings
+-- piggybacks on KOReader's lifecycle flush); we accept that for tighter
+-- crash-recovery (timestamps are durable as soon as a sync runs).
+--
+-- last_close_book_rel carves out the per-book exception for the close
+-- trigger: closing a *different* book hits a different `.sdr/`, so it's not
+-- redundant with the prior sync and is allowed regardless of the close
+-- cooldown. Closing the *same* book within the cooldown is the redundant
+-- case we skip.
+--
 -- Set true the first time init() schedules its startup sync this KOReader
 -- process. Each FileManager↔ReaderUI transition re-instantiates the plugin
 -- and re-runs init(); without this guard, opening a book or closing it back
 -- to the file manager would re-fire a full-library progress sync (and the
--- chained book sync on the close-into-FM transition) every time the cooldown
--- window had already elapsed.
+-- chained book sync on the close-into-FM transition) every time the
+-- in-process scheduling slot was free. Distinct from the cooldown — the
+-- cooldown is the cross-trigger throttle (whether ANY sync ran recently),
+-- this boolean is "did the startup-specific scheduleIn fire already in
+-- THIS process". Module-local because we want to fire startup at most once
+-- per process even if the persistent cooldown would otherwise admit it
+-- (e.g. user toggled cooldown to 0).
 local startup_sync_scheduled = false
 local DEFAULT_COOLDOWN = 300
 local COOLDOWN_MIN = 0
@@ -89,6 +108,16 @@ local function get_close_cooldown()
     return v
 end
 
+local function read_timestamp(key)
+    local v = sync.read_state(key)
+    return (type(v) == "number") and v or 0
+end
+
+local function read_string(key)
+    local v = sync.read_state(key)
+    return (type(v) == "string") and v or nil
+end
+
 -- Master gate: when off, no auto trigger (startup, Resume, close) does
 -- anything. Manual entry points (menu items, Dispatcher actions) bypass.
 local function is_master_on()
@@ -106,23 +135,25 @@ end
 local function should_run_auto()
     local cooldown = get_cooldown()
     if cooldown <= 0 then return true end
-    return os.time() - auto_sync_last_run >= cooldown
+    return os.time() - read_timestamp("last_auto_run_at") >= cooldown
 end
 
 local function should_run_close(book_rel)
-    if book_rel ~= last_close_book_rel then return true end
+    if book_rel ~= read_string("last_close_book_rel") then return true end
     local cooldown = get_close_cooldown()
     if cooldown <= 0 then return true end
-    return os.time() - close_sync_last_run >= cooldown
+    return os.time() - read_timestamp("last_close_run_at") >= cooldown
 end
 
 local function mark_auto_run()
-    auto_sync_last_run = os.time()
+    sync.write_state({ last_auto_run_at = os.time() })
 end
 
 local function mark_close_run(book_rel)
-    close_sync_last_run = os.time()
-    last_close_book_rel = book_rel
+    sync.write_state({
+        last_close_run_at = os.time(),
+        last_close_book_rel = book_rel,
+    })
 end
 
 -- In-flight guard. Both book sync and progress sync mutate the same
