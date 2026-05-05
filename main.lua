@@ -177,16 +177,34 @@ local AUTO_TRIGGER_NET_RETRY_MAX = 6  -- ~30 s total
 
 local function defer_until_online(label, retries_left, retry_fn)
     local NetworkMgr = require("ui/network/manager")
-    if not NetworkMgr.isOnline or NetworkMgr:isOnline() then
+    -- isOnline() is just a DNS probe (canResolveHostnames at
+    -- manager.lua:314, `socket.dns.toip("dns.msftncsi.com")`) — DNS
+    -- can succeed against cached records before the kernel routing
+    -- table is populated. We've seen the resulting failure mode in
+    -- the wild: isOnline() returns true on the first retry after
+    -- Resume, the sync proceeds, and the very next PROPFIND fails
+    -- with "Network is unreachable" (the OS-level errno from a
+    -- routeless socket). hasDefaultRoute (manager.lua:285) catches
+    -- that — it does a UDP setpeername on a documentation-range IP
+    -- (203.0.113.1 / 2001:db8::1) which returns false in exactly
+    -- the no-route state. Require both. Defensive existence checks
+    -- match the pattern used elsewhere; on a hypothetical older
+    -- KOReader build that lacks one or the other, the missing check
+    -- is treated as pass.
+    local online = (NetworkMgr.isOnline == nil) or NetworkMgr:isOnline()
+    local has_route = (NetworkMgr.hasDefaultRoute == nil) or NetworkMgr:hasDefaultRoute()
+    if online and has_route then
         return false  -- caller proceeds inline
     end
     if retries_left <= 0 then
-        logger.dbg("webdav_autosync: " .. label .. " skip reason=offline-give-up")
+        logger.dbg(string.format(
+            "webdav_autosync: %s skip reason=offline-give-up online=%s has_route=%s",
+            label, tostring(online), tostring(has_route)))
         return true
     end
     logger.dbg(string.format(
-        "webdav_autosync: %s defer reason=offline retries_left=%d",
-        label, retries_left))
+        "webdav_autosync: %s defer reason=offline online=%s has_route=%s retries_left=%d",
+        label, tostring(online), tostring(has_route), retries_left))
     UIManager:scheduleIn(AUTO_TRIGGER_NET_RETRY_INTERVAL_SECS,
         function() retry_fn(retries_left - 1) end)
     return true
