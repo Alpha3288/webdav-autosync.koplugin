@@ -156,6 +156,42 @@ local function mark_close_run(book_rel)
     })
 end
 
+-- Wi-Fi reconnect after Suspend is async on KOReader devices that bring
+-- the network up lazily (Kindle, Kobo); isOnline() (a real-time DNS
+-- probe at frontend/ui/network/manager.lua:588) returns false for
+-- several seconds after onResume fires. KOReader's willRerunWhenOnline
+-- and runWhenOnline helpers don't fit our case: when isConnected() (the
+-- cached flag) is true but isOnline() (DNS) currently fails, they call
+-- beforeWifiAction *without* the callback (manager.lua@v2026.03 lines
+-- 679-680, "Avoid infinite recursion, beforeWifiAction only guarantees
+-- isConnected, not isOnline") — the caller is left waiting on an event
+-- nobody will fire. Those helpers are also tied to the
+-- wifi_enable_action state machine, which an auto trigger has no
+-- business engaging — manual triggers prompt via ConfirmBox; auto
+-- triggers should be invisible. Hence: poll isOnline() ourselves with
+-- bounded retries. Same approach for Resume and post-init startup;
+-- each retry re-runs the full handler from the top so toggle/cooldown
+-- changes during the wait take effect immediately.
+local AUTO_TRIGGER_NET_RETRY_INTERVAL_SECS = 5
+local AUTO_TRIGGER_NET_RETRY_MAX = 6  -- ~30 s total
+
+local function defer_until_online(label, retries_left, retry_fn)
+    local NetworkMgr = require("ui/network/manager")
+    if not NetworkMgr.isOnline or NetworkMgr:isOnline() then
+        return false  -- caller proceeds inline
+    end
+    if retries_left <= 0 then
+        logger.dbg("webdav_autosync: " .. label .. " skip reason=offline-give-up")
+        return true
+    end
+    logger.dbg(string.format(
+        "webdav_autosync: %s defer reason=offline retries_left=%d",
+        label, retries_left))
+    UIManager:scheduleIn(AUTO_TRIGGER_NET_RETRY_INTERVAL_SECS,
+        function() retry_fn(retries_left - 1) end)
+    return true
+end
+
 -- In-flight guard. Both book sync and progress sync mutate the same
 -- on-disk LuaSettings cache (webdav_autosync_state.lua). If a sync
 -- is paused on the conflict dialog and the user kicks off a second
@@ -231,7 +267,7 @@ function WebDAVSync:init()
     startup_sync_scheduled = true
     logger.dbg("webdav_autosync: init scheduling startup sync in 2s ui=" .. ui_kind)
     UIManager:scheduleIn(2, function()
-        local function run_startup_sync()
+        local function run_startup_sync(retries_left)
             local progress_on = event_enabled("progress_on_startup")
             local books_on = event_enabled("books_on_startup")
             if not progress_on and not books_on then
@@ -242,17 +278,9 @@ function WebDAVSync:init()
                 logger.dbg("webdav_autosync: trigger=startup skip reason=cooldown")
                 return
             end
-            -- Wi-Fi often isn't up yet 2 s after init() on devices that
-            -- bring the network online lazily (Kindle/Kobo). The runners
-            -- below check isOnline() (a real DNS probe) and silently
-            -- no-op when offline, but only after mark_auto_run() has
-            -- already burned the next 5 min of cooldown. Defer instead:
-            -- willRerunWhenOnline re-invokes this body once the network
-            -- is genuinely up, without prompting the user.
-            local NetworkMgr = require("ui/network/manager")
-            if NetworkMgr.willRerunWhenOnline
-                and NetworkMgr:willRerunWhenOnline(run_startup_sync) then
-                logger.dbg("webdav_autosync: trigger=startup defer reason=offline")
+            if defer_until_online("trigger=startup",
+                retries_left or AUTO_TRIGGER_NET_RETRY_MAX,
+                run_startup_sync) then
                 return
             end
             mark_auto_run()
@@ -515,7 +543,7 @@ end
 -- two dialog chains can't end up stacked on screen at the same time; book
 -- sync starts only once progress sync has fully resolved its conflicts.
 -- Cooldown is consumed up here so the chain counts as a single auto slot.
-function WebDAVSync:onResume()
+function WebDAVSync:onResume(retries_left)
     local progress_on = event_enabled("progress_on_resume")
     local books_on = event_enabled("books_on_resume")
     if not progress_on and not books_on then
@@ -526,17 +554,9 @@ function WebDAVSync:onResume()
         logger.dbg("webdav_autosync: trigger=resume skip reason=cooldown")
         return
     end
-    -- Wi-Fi reconnect after suspend is async on most KOReader devices, so
-    -- isOnline() (a real DNS probe) returns false for several seconds
-    -- after Resume fires. Without this defer the runners below silently
-    -- no-op against their own offline check, *and* mark_auto_run() has
-    -- already burned the next cooldown window for nothing. Re-enter
-    -- onResume from the willRerunWhenOnline callback once the network
-    -- is genuinely up; the toggles and cooldown are re-checked there.
-    local NetworkMgr = require("ui/network/manager")
-    if NetworkMgr.willRerunWhenOnline
-        and NetworkMgr:willRerunWhenOnline(function() self:onResume() end) then
-        logger.dbg("webdav_autosync: trigger=resume defer reason=offline")
+    if defer_until_online("trigger=resume",
+        retries_left or AUTO_TRIGGER_NET_RETRY_MAX,
+        function(n) self:onResume(n) end) then
         return
     end
     mark_auto_run()
