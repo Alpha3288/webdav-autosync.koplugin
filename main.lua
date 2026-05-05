@@ -231,30 +231,46 @@ function WebDAVSync:init()
     startup_sync_scheduled = true
     logger.dbg("webdav_autosync: init scheduling startup sync in 2s ui=" .. ui_kind)
     UIManager:scheduleIn(2, function()
-        local progress_on = event_enabled("progress_on_startup")
-        local books_on = event_enabled("books_on_startup")
-        if not progress_on and not books_on then
-            logger.dbg("webdav_autosync: trigger=startup skip reason=disabled")
-            return
+        local function run_startup_sync()
+            local progress_on = event_enabled("progress_on_startup")
+            local books_on = event_enabled("books_on_startup")
+            if not progress_on and not books_on then
+                logger.dbg("webdav_autosync: trigger=startup skip reason=disabled")
+                return
+            end
+            if not should_run_auto() then
+                logger.dbg("webdav_autosync: trigger=startup skip reason=cooldown")
+                return
+            end
+            -- Wi-Fi often isn't up yet 2 s after init() on devices that
+            -- bring the network online lazily (Kindle/Kobo). The runners
+            -- below check isOnline() (a real DNS probe) and silently
+            -- no-op when offline, but only after mark_auto_run() has
+            -- already burned the next 5 min of cooldown. Defer instead:
+            -- willRerunWhenOnline re-invokes this body once the network
+            -- is genuinely up, without prompting the user.
+            local NetworkMgr = require("ui/network/manager")
+            if NetworkMgr.willRerunWhenOnline
+                and NetworkMgr:willRerunWhenOnline(run_startup_sync) then
+                logger.dbg("webdav_autosync: trigger=startup defer reason=offline")
+                return
+            end
+            mark_auto_run()
+            logger.info(string.format(
+                "webdav_autosync: trigger=startup progress=%s books=%s",
+                tostring(progress_on), tostring(books_on)))
+            if progress_on then
+                self:doProgressSync({
+                    trigger = "startup",
+                    on_done = function()
+                        if books_on then self:maybeRunBookAutoSync() end
+                    end,
+                })
+            else
+                self:maybeRunBookAutoSync()
+            end
         end
-        if not should_run_auto() then
-            logger.dbg("webdav_autosync: trigger=startup skip reason=cooldown")
-            return
-        end
-        mark_auto_run()
-        logger.info(string.format(
-            "webdav_autosync: trigger=startup progress=%s books=%s",
-            tostring(progress_on), tostring(books_on)))
-        if progress_on then
-            self:doProgressSync({
-                trigger = "startup",
-                on_done = function()
-                    if books_on then self:maybeRunBookAutoSync() end
-                end,
-            })
-        else
-            self:maybeRunBookAutoSync()
-        end
+        run_startup_sync()
     end)
 end
 
@@ -508,6 +524,19 @@ function WebDAVSync:onResume()
     end
     if not should_run_auto() then
         logger.dbg("webdav_autosync: trigger=resume skip reason=cooldown")
+        return
+    end
+    -- Wi-Fi reconnect after suspend is async on most KOReader devices, so
+    -- isOnline() (a real DNS probe) returns false for several seconds
+    -- after Resume fires. Without this defer the runners below silently
+    -- no-op against their own offline check, *and* mark_auto_run() has
+    -- already burned the next cooldown window for nothing. Re-enter
+    -- onResume from the willRerunWhenOnline callback once the network
+    -- is genuinely up; the toggles and cooldown are re-checked there.
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr.willRerunWhenOnline
+        and NetworkMgr:willRerunWhenOnline(function() self:onResume() end) then
+        logger.dbg("webdav_autosync: trigger=resume defer reason=offline")
         return
     end
     mark_auto_run()
