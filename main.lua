@@ -32,16 +32,30 @@ local WebDAVSync = WidgetContainer:extend{
     is_doc_only = false,
 }
 
--- Single global cooldown shared across all auto trigger paths (close, Resume,
--- startup, and the chained book auto-sync). Module-local so it's shared
--- across the FileManager and ReaderUI plugin instances — KOReader broadcasts
--- Resume to both, and we want at most one sync per cool-down window.
+-- Two independent cooldowns:
+--   * auto_sync_last_run / get_cooldown() — full-library reconciles (Resume,
+--     startup, and the chained book auto-sync). The expensive case the
+--     cooldown was originally for; default 300 s.
+--   * close_sync_last_run / get_close_cooldown() — the scoped close trigger
+--     (one PROPFIND on the just-closed book's `.sdr/`). Cheap enough that it
+--     deserves a much shorter knob; default 30 s.
+--
+-- The two timestamps are independent: a close-triggered sync does NOT push
+-- back the next full reconcile, and a Resume/startup sync does NOT push back
+-- the next close trigger. That keeps each path's debounce limited to its own
+-- redundancy case (same book closed twice in quick succession; multiple
+-- wakes in quick succession) without one suppressing the other.
+--
+-- Module-local so the timestamps are shared across the FileManager and
+-- ReaderUI plugin instances — KOReader broadcasts Resume to both, and we
+-- want at most one sync per cool-down window.
 --
 -- last_close_book_rel carves out the per-book exception for the close trigger:
 -- closing a *different* book hits a different `.sdr/`, so it's not redundant
--- with the prior sync and is allowed regardless of the global cooldown.
+-- with the prior sync and is allowed regardless of the close cooldown.
 -- Closing the *same* book within the cooldown is the redundant case we skip.
 local auto_sync_last_run = 0
+local close_sync_last_run = 0
 local last_close_book_rel = nil
 -- Set true the first time init() schedules its startup sync this KOReader
 -- process. Each FileManager↔ReaderUI transition re-instantiates the plugin
@@ -50,16 +64,28 @@ local last_close_book_rel = nil
 -- chained book sync on the close-into-FM transition) every time the cooldown
 -- window had already elapsed.
 local startup_sync_scheduled = false
-local DEFAULT_COOLDOWN = 120
+local DEFAULT_COOLDOWN = 300
 local COOLDOWN_MIN = 0
 local COOLDOWN_MAX = 1800
 local COOLDOWN_STEP = 30
+local DEFAULT_CLOSE_COOLDOWN = 30
+local CLOSE_COOLDOWN_MIN = 0
+local CLOSE_COOLDOWN_MAX = 600
+local CLOSE_COOLDOWN_STEP = 10
 
 local function get_cooldown()
     local v = G_reader_settings and G_reader_settings:readSetting("webdav_autosync_cooldown_seconds")
     if type(v) ~= "number" then return DEFAULT_COOLDOWN end
     if v < COOLDOWN_MIN then return COOLDOWN_MIN end
     if v > COOLDOWN_MAX then return COOLDOWN_MAX end
+    return v
+end
+
+local function get_close_cooldown()
+    local v = G_reader_settings and G_reader_settings:readSetting("webdav_autosync_close_cooldown_seconds")
+    if type(v) ~= "number" then return DEFAULT_CLOSE_COOLDOWN end
+    if v < CLOSE_COOLDOWN_MIN then return CLOSE_COOLDOWN_MIN end
+    if v > CLOSE_COOLDOWN_MAX then return CLOSE_COOLDOWN_MAX end
     return v
 end
 
@@ -85,7 +111,9 @@ end
 
 local function should_run_close(book_rel)
     if book_rel ~= last_close_book_rel then return true end
-    return should_run_auto()
+    local cooldown = get_close_cooldown()
+    if cooldown <= 0 then return true end
+    return os.time() - close_sync_last_run >= cooldown
 end
 
 local function mark_auto_run()
@@ -93,7 +121,7 @@ local function mark_auto_run()
 end
 
 local function mark_close_run(book_rel)
-    auto_sync_last_run = os.time()
+    close_sync_last_run = os.time()
     last_close_book_rel = book_rel
 end
 
@@ -348,7 +376,20 @@ function WebDAVSync:addToMainMenu(menu_items)
                         callback = function()
                             self:setCooldown()
                         end,
-                        help_text = _("Minimum seconds between auto-triggered syncs (book close, device wake, KOReader startup). Manual syncs and closing a different book always run regardless. 0 disables the cooldown. Default 120 s."),
+                        help_text = _("Minimum seconds between auto-triggered full reconciles (device wake, KOReader startup). Manual syncs always run regardless. The book-close trigger has its own cooldown below. 0 disables. Default 300 s."),
+                    },
+                    {
+                        text_func = function()
+                            return T(_("Close-trigger sync cooldown: %1 s"), tostring(get_close_cooldown()))
+                        end,
+                        enabled_func = function()
+                            return G_reader_settings:isTrue("webdav_autosync_master")
+                        end,
+                        keep_menu_open = true,
+                        callback = function()
+                            self:setCloseCooldown()
+                        end,
+                        help_text = _("Minimum seconds between two consecutive close-trigger syncs of the same book. Closing a different book always runs regardless (each book's .sdr/ is independent). 0 disables. Default 30 s."),
                     },
                 },
             },
@@ -625,7 +666,7 @@ end
 function WebDAVSync:setCooldown()
     UIManager:show(SpinWidget:new{
         title_text = _("Auto sync cooldown (seconds)"),
-        info_text = _("Minimum seconds between auto-triggered syncs (book close, device wake, KOReader startup). Manual syncs and closing a different book always run regardless. Set to 0 to disable the cooldown."),
+        info_text = _("Minimum seconds between auto-triggered full reconciles (device wake, KOReader startup). Manual syncs always run regardless. The book-close trigger has its own cooldown. Set to 0 to disable."),
         value = get_cooldown(),
         value_min = COOLDOWN_MIN,
         value_max = COOLDOWN_MAX,
@@ -635,6 +676,23 @@ function WebDAVSync:setCooldown()
         ok_text = _("Set"),
         callback = function(spin)
             G_reader_settings:saveSetting("webdav_autosync_cooldown_seconds", spin.value)
+        end,
+    })
+end
+
+function WebDAVSync:setCloseCooldown()
+    UIManager:show(SpinWidget:new{
+        title_text = _("Close-trigger cooldown (seconds)"),
+        info_text = _("Minimum seconds between two consecutive close-trigger syncs of the same book. Closing a different book always runs regardless. Set to 0 to disable."),
+        value = get_close_cooldown(),
+        value_min = CLOSE_COOLDOWN_MIN,
+        value_max = CLOSE_COOLDOWN_MAX,
+        value_step = CLOSE_COOLDOWN_STEP,
+        value_hold_step = CLOSE_COOLDOWN_STEP * 3,
+        default_value = DEFAULT_CLOSE_COOLDOWN,
+        ok_text = _("Set"),
+        callback = function(spin)
+            G_reader_settings:saveSetting("webdav_autosync_close_cooldown_seconds", spin.value)
         end,
     })
 end
@@ -1308,7 +1366,8 @@ WHAT EACH MENU ITEM DOES
   - Enable auto sync — master switch. Off: nothing fires automatically (manual sync still works). On: each individual trigger toggle below takes effect.
   - Sync books on startup / on wake — when on, run book sync at KOReader startup and/or when the device wakes. File-manager context only.
   - Sync reading progress on startup / on wake / on book close — when on, run progress sync at startup, on wake, and/or after closing a book. The startup and wake triggers reconcile the whole library; the book-close trigger pushes only the just-closed book (one network request) and silently defers any conflict to the next startup/wake.
-  - Auto sync cooldown — minimum seconds between auto-triggered syncs. Manual syncs and closing a *different* book always run regardless. Default 120 s. Set to 0 to disable.
+  - Auto sync cooldown — minimum seconds between auto-triggered full reconciles (wake / startup). Manual syncs always run regardless. Default 300 s. Set to 0 to disable.
+  - Close-trigger sync cooldown — minimum seconds between two close-trigger syncs of the *same* book. Closing a *different* book always runs regardless. Default 30 s. Set to 0 to disable.
 
 HOW TO SET IT UP
 
