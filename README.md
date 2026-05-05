@@ -12,7 +12,8 @@ Sync files from a WebDAV server to your device. Optional credentials, configurab
   - *Enable auto sync* – master on/off. When off, none of the triggers below fire (manual sync still works). When off, the per-event toggles below appear greyed out.
   - *Sync books on startup* / *Sync books on wake* – run book sync at KOReader startup and/or after the device wakes from sleep. File-manager context only.
   - *Sync reading progress on startup* / *on wake* / *on book close* – run progress sync at startup, on wake, and/or after closing a book. Startup and wake reconcile the whole library; the book-close trigger pushes only the just-closed book (one network request) and silently defers any conflict to the next startup/wake.
-  - *Auto sync cooldown* – minimum seconds between auto-triggered syncs. Manual syncs and closing a *different* book always run regardless. Default 120 s, range 0–1800 s. Set to 0 to disable.
+  - *Auto sync cooldown* – minimum seconds between auto-triggered full reconciles (wake / startup). Manual syncs always run regardless. Default 300 s, range 0–1800 s. Set to 0 to disable.
+  - *Close-trigger sync cooldown* – minimum seconds between two consecutive close-trigger syncs of the *same* book. Closing a *different* book always runs regardless. Default 30 s, range 0–600 s. Set to 0 to disable.
 - **Manual sync** – Use **Sync books now** or **Sync reading progress now** from the menu at any time. Both actions are also exposed in the Dispatcher (`WebDAV sync books now`, `WebDAV sync reading progress now`), so you can bind them to a gesture, profile, or reader-top toolbar button. Manual entries bypass both the master and the per-event toggles.
 - **Two-way book sync (optional)** – When enabled, book sync also uploads new or changed local files back to the server. Affects book sync only — reading-progress sync is always bidirectional. Uses a small state cache to detect what changed since the last sync, so re-runs only transfer files that actually moved. Conflicts (a file changed on both sides) surface as a per-file dialog at the next interactive moment (manual sync, startup, or wake) — silent triggers leave them pending. Deletions are never propagated.
 - **Reading-progress sync** – When the relevant per-event toggles are on, the plugin keeps each book's `.sdr` sidecar (last reading position, bookmarks, highlights, custom metadata, custom cover) in sync across devices via the same WebDAV server. Requires KOReader's *Document → Metadata folder* to be set to *Book folder* (the default), since only that mode places sidecars next to books.
@@ -27,14 +28,14 @@ flowchart TD
     Startup([KOReader startup])
     Manual([Menu / Dispatcher action])
 
-    Close --> CG{Same book<br/>closed within cooldown?}
+    Close --> CG{Same book closed<br/>within close cooldown?}
     CG -- yes --> Skip([skip])
     CG -- no --> Scoped[Scoped progress sync<br/>1 PROPFIND on this book's .sdr/]
 
-    Resume --> AG{Cooldown<br/>since last auto run?}
+    Resume --> AG{Within auto<br/>sync cooldown?}
     Startup --> AG
-    AG -- no --> Skip
-    AG -- yes --> Full[Full progress reconcile<br/>+ chained book auto-sync]
+    AG -- yes --> Skip
+    AG -- no --> Full[Full progress reconcile<br/>+ chained book auto-sync]
 
     Manual --> Bump[Reset cooldown,<br/>run full reconcile]
 
@@ -53,10 +54,11 @@ flowchart TD
 
 - The four entry points on the left are the only things that ever start a sync. There is **no** sync triggered by Suspend or by reading position changes — only by the events shown.
 - **Each automatic entry point is its own toggle** (in *Auto sync triggers*) and is gated by the master *Enable auto sync* switch. With the master off (or that specific event toggle off), the corresponding arrow into the diagram is dead — the event simply doesn't enter the flow. Manual entries always run regardless.
-- **Close** is cheap (one network request, scoped to the just-closed book) and has its own per-book gate. Closing book A then book B fires twice; closing book A then book A again within the cooldown only fires once.
-- **Wake** and **Startup** share the global cooldown — they're the catch-up moments when full library reconciles happen and any held conflicts are surfaced. At each, only the syncs whose toggles are on actually run; if both *progress* and *books* on-startup are on, progress runs first and books chain after.
-- **Manual** triggers always run, and they reset the cooldown so an auto trigger right after won't fire redundantly.
-- The cooldown defaults to **120 seconds** but is configurable from the menu (**Auto sync cooldown**, inside the *Auto sync triggers* submenu). Set it to 0 to disable the cooldown entirely.
+- **Close** is cheap (one network request, scoped to the just-closed book) and has its own short cooldown — separate from the wake/startup one. Closing book A then book B fires twice (different `.sdr/`); closing book A then book A again within the close cooldown is debounced.
+- **Wake** and **Startup** share the auto sync cooldown — they're the catch-up moments when full library reconciles happen and any held conflicts are surfaced. At each, only the syncs whose toggles are on actually run; if both *progress* and *books* on-startup are on, progress runs first and books chain after.
+- **Manual** triggers always run, and they reset the auto sync cooldown so a wake/startup trigger right after won't fire redundantly. Manual does not reset the close cooldown.
+- The two cooldowns are independent: a close-triggered sync does not push back the next wake/startup reconcile, and vice versa. Defaults are **300 s** for wake/startup (*Auto sync cooldown*) and **30 s** for the close trigger (*Close-trigger sync cooldown*); both are in the *Auto sync triggers* submenu, both accept 0 to disable.
+- Cooldown timestamps are persisted across KOReader restarts (in the plugin's state file alongside the per-file sync cache), so killing and reopening KOReader within the cooldown window won't bypass it.
 - Conflicts produced by a silent close are stored without dialog and shown the next time an interactive trigger runs.
 
 ## Installation
@@ -76,7 +78,8 @@ flowchart TD
 7. **Auto sync triggers** – Open the submenu and:
    - Flip **Enable auto sync** on (master). The per-event toggles only take effect with the master on.
    - Toggle the events you want: **Sync books on startup**, **Sync books on wake**, **Sync reading progress on startup**, **Sync reading progress on wake**, **Sync reading progress on book close**. Each is independent; e.g. you can have only "on book close" on if you don't want library-wide reconciles.
-   - **Auto sync cooldown** – minimum gap between auto-triggered syncs (default 120 s, 0 disables). Manual syncs and closing a different book always run regardless.
+   - **Auto sync cooldown** – minimum gap between auto-triggered full reconciles, i.e. wake / startup (default 300 s, 0 disables). Manual syncs always run regardless.
+   - **Close-trigger sync cooldown** – minimum gap between two consecutive close-trigger syncs of the same book (default 30 s, 0 disables). Closing a *different* book always runs regardless.
 8. **Sync books now** – Run a full book-file sync manually (lists all files on the server, downloads matching ones into the chosen folder; with two-way on, also uploads local changes).
 9. **Sync reading progress now** – Reconcile `.sdr` sidecars on demand without waiting for an event trigger.
 10. **Help** – Open an in-app reference of what each menu item does and how to set it up.
@@ -94,7 +97,7 @@ Sync downloads **all files** under the server URL recursively; subfolders are re
 
 - Syncs every file inside any `<book>.sdr/` directory under the download folder — typically `metadata.<ext>.lua` (last reading position, bookmarks, highlights), plus `custom_metadata.lua` and any custom cover image.
 - **Triggers** (see the [flow diagram](#how-auto-sync-triggers-work) above for the full picture):
-  - *Book close*: silent. Scoped — only one PROPFIND on the just-closed book's `.sdr/`, not a full library walk. Per-book debounce: closing a different book always fires; closing the same book twice within 120 s is debounced.
+  - *Book close*: silent. Scoped — only one PROPFIND on the just-closed book's `.sdr/`, not a full library walk. Per-book debounce: closing a different book always fires; closing the same book twice within the close-trigger cooldown (default 30 s) is debounced.
   - *Device wake*, *KOReader startup*: interactive, full library reconcile. Held conflicts surface as a dialog chain.
   - *Manual* (menu item or Dispatcher action): interactive at any time, bypasses the debounce, prompts to enable Wi-Fi if it's off.
   - There is no Suspend trigger — the close trigger already pushed the just-edited book, so a full walk during suspend is redundant and a needless hit on the server's rate limit.
