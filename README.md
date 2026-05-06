@@ -11,12 +11,12 @@ Sync files from a WebDAV server to your device. Optional credentials, configurab
 - **Auto sync triggers (granular, opt-in)** – Each automatic trigger is its own toggle, all grouped in the **Auto sync triggers** submenu and gated by a master switch:
   - *Enable auto sync* – master on/off. When off, none of the triggers below fire (manual sync still works). When off, the per-event toggles below appear greyed out.
   - *Sync books on startup* / *Sync books on wake* – run book sync at KOReader startup and/or after the device wakes from sleep. File-manager context only.
-  - *Sync reading progress on startup* / *on wake* / *on book close* – run progress sync at startup, on wake, and/or after closing a book. Startup and wake reconcile the whole library; the book-close trigger pushes only the just-closed book (one network request) and silently defers any conflict to the next startup/wake.
+  - *Sync reading progress on startup* / *on wake* / *on book close* – run progress sync at startup, on wake, and/or after closing a book. Startup and wake reconcile the whole library; the book-close trigger pushes only the just-closed book (one network request). All three surface conflicts via the per-file dialog as soon as they're detected.
   - *Auto sync cooldown* – minimum seconds between auto-triggered full reconciles (wake / startup). Manual syncs always run regardless. Default 300 s, range 0–1800 s. Set to 0 to disable.
   - *Close-trigger sync cooldown* – minimum seconds between two consecutive close-trigger syncs of the *same* book. Closing a *different* book always runs regardless. Default 30 s, range 0–600 s. Set to 0 to disable.
   - *Wake settle delay* – how long to wait after the device wakes before starting an auto-sync. Filters brief system wakes (RTC alarms, hall-sensor twitches, framework background tasks) so they don't burn the cooldown. Default 15 s, range 0–60 s. Set to 0 to run inline on wake (pre-1.7.8 behavior).
 - **Manual sync** – Use **Sync books now** or **Sync reading progress now** from the menu at any time. Both actions are also exposed in the Dispatcher (`WebDAV sync books now`, `WebDAV sync reading progress now`), so you can bind them to a gesture, profile, or reader-top toolbar button. Manual entries bypass both the master and the per-event toggles.
-- **Two-way book sync (optional)** – When enabled, book sync also uploads new or changed local files back to the server. Affects book sync only — reading-progress sync is always bidirectional. Uses a small state cache to detect what changed since the last sync, so re-runs only transfer files that actually moved. Conflicts (a file changed on both sides) surface as a per-file dialog at the next interactive moment (manual sync, startup, or wake) — silent triggers leave them pending. Deletions are never propagated.
+- **Two-way book sync (optional)** – When enabled, book sync also uploads new or changed local files back to the server. Affects book sync only — reading-progress sync is always bidirectional. Uses a small state cache to detect what changed since the last sync, so re-runs only transfer files that actually moved. Conflicts (a file changed on both sides) surface as a per-file dialog as soon as they're detected, regardless of which trigger is running. Deletions are never propagated.
 - **Reading-progress sync** – When the relevant per-event toggles are on, the plugin keeps each book's `.sdr` sidecar (last reading position, bookmarks, highlights, custom metadata, custom cover) in sync across devices via the same WebDAV server. Requires KOReader's *Document → Metadata folder* to be set to *Book folder* (the default), since only that mode places sidecars next to books.
 - **Live library refresh** – After a sync writes files locally, the file browser, history, and collections views redraw automatically. New books appear and reading-progress badges (percent finished, status) update without needing to navigate away and back. Works for both book sync and reading-progress sync.
 
@@ -40,14 +40,11 @@ flowchart TD
 
     Manual --> Bump[Reset cooldown,<br/>run full reconcile]
 
-    Scoped --> SilentQ{Conflicts?}
-    SilentQ -- yes --> Hold[Held until next<br/>interactive trigger]
-    SilentQ -- no --> Done([done])
-
-    Full --> InterQ{Conflicts?}
-    Bump --> InterQ
-    InterQ -- yes --> Dialog[Per-file dialog:<br/>Keep local / Keep remote / Skip]
-    InterQ -- no --> Done
+    Scoped --> ConflictQ{Conflicts?}
+    Full --> ConflictQ
+    Bump --> ConflictQ
+    ConflictQ -- yes --> Dialog[Per-file dialog:<br/>Keep local / Keep remote / Skip]
+    ConflictQ -- no --> Done([done])
     Dialog --> Done
 ```
 
@@ -64,7 +61,6 @@ flowchart TD
 - **When startup or wake runs both reading-progress AND book sync together**, the merged failure popup (if any) lists each sync on its own line, with any per-file failures listed once at the bottom.
 - The two cooldowns are independent: a close-triggered sync does not push back the next wake/startup reconcile, and vice versa. Defaults are **300 s** for wake/startup (*Auto sync cooldown*) and **30 s** for the close trigger (*Close-trigger sync cooldown*); both are in the *Auto sync triggers* submenu, both accept 0 to disable.
 - Cooldown timestamps are persisted across KOReader restarts (in the plugin's state file alongside the per-file sync cache), so killing and reopening KOReader within the cooldown window won't bypass it.
-- Conflicts produced by a silent close are stored without dialog and shown the next time an interactive trigger runs.
 
 ## Installation
 
@@ -95,7 +91,7 @@ Sync downloads **all files** under the server URL recursively; subfolders are re
 
 - The same extension filter applies to uploads — only book files are pushed.
 - A small state cache (`<settings_dir>/webdav_autosync_state.lua`) tracks per-file fingerprints so unchanged files are skipped on every run. Progress sync shares this same cache.
-- **Conflicts** (a file changed on both sides since the last sync): you'll be asked per file to *Keep local (upload)*, *Keep remote (download)*, or *Skip*. The dialog appears on manual sync, at KOReader startup, and on wake-from-sleep. Conflicts that arise during a book-close sync are simply held until the next interactive moment, so you'll never get a dialog while you're closing a book.
+- **Conflicts** (a file changed on both sides since the last sync): you'll be asked per file to *Keep local (upload)*, *Keep remote (download)*, or *Skip*. The dialog appears for every trigger that detects a conflict — manual sync, startup, wake, and book close.
 - **No deletions**: removing a file on one side does not delete it on the other. The plugin remembers the deletion so it doesn't keep re-syncing the file back.
 
 ### Reading-progress sync details
