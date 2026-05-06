@@ -286,6 +286,16 @@ local function make_empty_chain_stats()
     }
 end
 
+-- Sum of `failed` across both sections (treating nil section as 0).
+-- Used by silent_mode chain orchestrators to decide whether to show
+-- the merged summary popup at all — silent_mode only shows on failure.
+local function chain_total_failed(chain_stats)
+    local n = 0
+    if chain_stats.progress then n = n + (chain_stats.progress.failed or 0) end
+    if chain_stats.books then n = n + (chain_stats.books.failed or 0) end
+    return n
+end
+
 local function defer_until_online(label, retries_left, retry_fn)
     local NetworkMgr = require("ui/network/manager")
     -- isOnline() is just a DNS probe (canResolveHostnames at
@@ -416,34 +426,36 @@ function WebDAVSync:init()
             logger.info(string.format(
                 "webdav_autosync: trigger=startup progress=%s books=%s",
                 tostring(progress_on), tostring(books_on)))
-            -- Startup keeps the "Syncing…" InfoMessage visible (unlike
-            -- Resume, which suppresses it). When BOTH progress and book
-            -- sync run, show ONE combined message at chain start and ONE
-            -- merged summary at chain end, instead of two of each.
+            -- Startup runs in silent_mode like Resume: no "Syncing…"
+            -- InfoMessage during the run, no summary popup at the end
+            -- unless something failed. Conflict dialogs still surface
+            -- (handled inside the runners). The chain branch shows a
+            -- single merged summary IFF total failed > 0.
             if progress_on and books_on then
-                local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
-                UIManager:show(syncing_msg)
-                UIManager:forceRePaint()
                 local chain_stats = make_empty_chain_stats()
                 self:doProgressSync({
                     trigger = "startup",
-                    show_syncing_message = false,
+                    silent_mode = true,
                     chain_stats = chain_stats,
                     on_done = function()
                         self:maybeRunBookAutoSync({
-                            show_syncing_message = false,
+                            silent_mode = true,
                             chain_stats = chain_stats,
                             on_done = function()
-                                UIManager:close(syncing_msg)
-                                self:showChainSummary(chain_stats)
+                                if chain_total_failed(chain_stats) > 0 then
+                                    self:showChainSummary(chain_stats)
+                                end
                             end,
                         })
                     end,
                 })
             elseif progress_on then
-                self:doProgressSync({ trigger = "startup" })
+                self:doProgressSync({
+                    trigger = "startup",
+                    silent_mode = true,
+                })
             else
-                self:maybeRunBookAutoSync()
+                self:maybeRunBookAutoSync({ silent_mode = true })
             end
         end
         run_startup_sync()
@@ -799,23 +811,24 @@ function WebDAVSync:runResumeSync(retries_left, opts)
     logger.info(string.format(
         "webdav_autosync: trigger=resume progress=%s books=%s",
         tostring(progress_on), tostring(books_on)))
-    -- On Resume, suppress per-sync "Syncing…" InfoMessages; the user just
-    -- woke the device and we don't want to barge in with a popup. When both
-    -- progress and book sync run, accumulate counts in chain_stats and show
-    -- ONE merged summary at chain end; standalone branches keep their own
-    -- per-runner summary.
+    -- Resume runs in silent_mode: no "Syncing…" popups, and the summary
+    -- popup fires only if something failed. Conflicts still pop the dialog
+    -- chain. When both progress and book sync run, accumulate into
+    -- chain_stats and show ONE merged summary IFF total failures > 0.
     if progress_on and books_on then
         local chain_stats = make_empty_chain_stats()
         self:doProgressSync({
             trigger = "resume",
-            show_syncing_message = false,
+            silent_mode = true,
             chain_stats = chain_stats,
             on_done = function()
                 self:maybeRunBookAutoSync({
-                    show_syncing_message = false,
+                    silent_mode = true,
                     chain_stats = chain_stats,
                     on_done = function()
-                        self:showChainSummary(chain_stats)
+                        if chain_total_failed(chain_stats) > 0 then
+                            self:showChainSummary(chain_stats)
+                        end
                     end,
                 })
             end,
@@ -823,10 +836,10 @@ function WebDAVSync:runResumeSync(retries_left, opts)
     elseif progress_on then
         self:doProgressSync({
             trigger = "resume",
-            show_syncing_message = false,
+            silent_mode = true,
         })
     else
-        self:maybeRunBookAutoSync({ show_syncing_message = false })
+        self:maybeRunBookAutoSync({ silent_mode = true })
     end
 end
 
@@ -1101,10 +1114,10 @@ function WebDAVSync:doSync(opts)
     opts = opts or {}
     local is_auto = opts.is_auto
     local turn_off_wifi = opts.turn_off_wifi
-    -- Default true for manual / startup; runResumeSync passes false on wake
-    -- so the InfoMessage doesn't barge in just as the user picks the device
-    -- up. The summary popup still fires.
-    local show_syncing_message = opts.show_syncing_message ~= false
+    -- silent_mode: auto-trigger UI (no syncing message, no summary on
+    -- success). Default false (manual UI: full popups). All auto callers
+    -- (startup, resume, close) pass true.
+    local silent_mode = opts.silent_mode == true
     local chain_stats = opts.chain_stats
     local on_done = opts.on_done
 
@@ -1174,7 +1187,7 @@ function WebDAVSync:doSync(opts)
         file_extensions = file_extensions,
         is_auto = is_auto,
         turn_off_wifi = turn_off_wifi,
-        show_syncing_message = show_syncing_message,
+        silent_mode = silent_mode,
         chain_stats = chain_stats,
         on_done = on_done,
     }
@@ -1189,10 +1202,14 @@ end
 
 function WebDAVSync:runOneWaySync(ctx)
     acquire_sync_lock()
-    local show_msg = ctx.show_syncing_message ~= false
+    -- silent_mode = true is the auto-trigger UI: no "Syncing…" InfoMessage
+    -- during the run, no summary popup at the end UNLESS something failed.
+    -- Conflict resolution dialogs and plan-failure popups are unaffected
+    -- (they're always shown — they need user attention).
+    local silent_mode = ctx.silent_mode == true
     local chain_stats = ctx.chain_stats
     local syncing_msg
-    if show_msg then
+    if not silent_mode then
         syncing_msg = InfoMessage:new{ text = _("Syncing…") }
         UIManager:show(syncing_msg)
         UIManager:forceRePaint()
@@ -1227,10 +1244,10 @@ function WebDAVSync:runOneWaySync(ctx)
             failures = failures,
             downloaded_rels = downloaded_rels,
         }, "books")
-    else
-        -- Always show whatever counts we have, even on partial failure: a
-        -- run that downloaded 4 files and failed on 1 should still report
-        -- "4 downloaded" alongside the failure summary.
+    elseif (not silent_mode) or failed > 0 or err then
+        -- Standalone path: show summary always when not silent_mode, or
+        -- only on failure when silent_mode. A run that downloaded 4 and
+        -- failed on 1 still reports "4 downloaded" alongside the failure.
         local parts = {}
         table.insert(parts, T(_("Downloaded %1 file(s)."), tostring(downloaded)))
         if skipped > 0 then
@@ -1252,10 +1269,11 @@ end
 
 function WebDAVSync:runTwoWaySync(ctx)
     acquire_sync_lock()
-    local show_msg = ctx.show_syncing_message ~= false
+    -- See runOneWaySync for silent_mode semantics — same here.
+    local silent_mode = ctx.silent_mode == true
     local chain_stats = ctx.chain_stats
     local syncing_msg
-    if show_msg then
+    if not silent_mode then
         syncing_msg = InfoMessage:new{ text = _("Syncing…") }
         UIManager:show(syncing_msg)
         UIManager:forceRePaint()
@@ -1277,6 +1295,8 @@ function WebDAVSync:runTwoWaySync(ctx)
                 failures = { _("book sync") .. " (" .. tostring(err) .. ")" },
             }, "books")
         else
+            -- Plan failure is *always* surfaced (even in silent_mode):
+            -- the user needs to know the sync didn't even start.
             UIManager:show(InfoMessage:new{
                 text = T(_("Sync failed: %1"), tostring(err)),
             })
@@ -1330,7 +1350,7 @@ function WebDAVSync:runTwoWaySync(ctx)
             stats.conflicts_skipped, stats.failed))
         if chain_stats then
             self:mergeChainStats(chain_stats, stats, "books")
-        else
+        elseif (not silent_mode) or stats.failed > 0 then
             self:showTwoWaySummary(stats)
         end
         self:turnOffWifiIfRequested(ctx)
@@ -1574,8 +1594,8 @@ end
 --- cooldown and per-event toggles are enforced by the event handler before
 --- this is called, so we don't re-check them here. File-manager-only — a
 --- full library scan inside a reader context would be disruptive.
---- opts.show_syncing_message: forwarded to doSync; default true. Resume
----                            passes false so the wake event doesn't barge in.
+--- opts.silent_mode:          forwarded to doSync; auto-trigger UI when
+---                            true (no syncing message, no success summary).
 --- opts.chain_stats:          when set, doSync's runner accumulates into it
 ---                            instead of showing its own summary.
 --- opts.on_done:              called on every exit path (no-op skip, sync
@@ -1597,7 +1617,7 @@ function WebDAVSync:maybeRunBookAutoSync(opts)
 
     self:doSync({
         is_auto = true,
-        show_syncing_message = opts.show_syncing_message,
+        silent_mode = opts.silent_mode,
         chain_stats = opts.chain_stats,
         on_done = opts.on_done,
     })
@@ -1619,7 +1639,7 @@ function WebDAVSync:doProgressSync(opts)
     opts = opts or {}
     local manual = opts.manual == true
     local on_done = opts.on_done
-    local show_syncing_message = opts.show_syncing_message ~= false
+    local silent_mode = opts.silent_mode == true
     local chain_stats = opts.chain_stats
     local function done() if on_done then on_done() end end
 
@@ -1674,7 +1694,7 @@ function WebDAVSync:doProgressSync(opts)
             server_url = server_url,
             local_folder = local_folder,
             on_done = on_done,
-            show_syncing_message = show_syncing_message,
+            silent_mode = silent_mode,
             chain_stats = chain_stats,
         })
         return
@@ -1698,7 +1718,7 @@ function WebDAVSync:doProgressSync(opts)
         server_url = server_url,
         local_folder = local_folder,
         on_done = on_done,
-        show_syncing_message = show_syncing_message,
+        silent_mode = silent_mode,
         chain_stats = chain_stats,
     })
 end
@@ -1784,19 +1804,22 @@ end
 
 --- Run a full-library progress sync. Surfaces plan errors, runs the
 --- conflict dialog chain, and shows a summary at the end.
---- opts.show_syncing_message: default true. Resume passes false.
+--- opts.silent_mode:          auto-trigger UI when true — no "Syncing
+---                            reading progress…" InfoMessage during the
+---                            run, no summary popup at the end UNLESS
+---                            something failed. Default false (manual UI).
 --- opts.chain_stats:          optional accumulator. When set, this run's
----                            counts are added to it and the per-run
----                            summary popup is suppressed; the chain
----                            orchestrator shows ONE merged summary at
----                            chain end. Plan failure folds into the
----                            accumulator as one synthetic failure entry.
+---                            counts are stored in it (under "progress")
+---                            and the per-run summary popup is suppressed;
+---                            the chain orchestrator shows ONE merged
+---                            summary at chain end. Plan failure folds in
+---                            as one synthetic failure entry.
 --- Silent close-trigger syncs go through doProgressSyncForBook instead.
 function WebDAVSync:runProgressSync(opts)
     local server_url = opts.server_url
     local local_folder = opts.local_folder
     local on_done = opts.on_done
-    local show_msg = opts.show_syncing_message ~= false
+    local silent_mode = opts.silent_mode == true
     local chain_stats = opts.chain_stats
     local function done() if on_done then on_done() end end
 
@@ -1805,7 +1828,7 @@ function WebDAVSync:runProgressSync(opts)
     local password = self:getSetting("password", "")
 
     local syncing_msg
-    if show_msg then
+    if not silent_mode then
         syncing_msg = InfoMessage:new{ text = _("Syncing reading progress…") }
         UIManager:show(syncing_msg)
         UIManager:forceRePaint()
@@ -1827,6 +1850,8 @@ function WebDAVSync:runProgressSync(opts)
                 failures = { _("progress sync") .. " (" .. tostring(err) .. ")" },
             }, "progress")
         else
+            -- Plan failure is *always* surfaced (even in silent_mode):
+            -- the user needs to know the sync didn't even start.
             UIManager:show(InfoMessage:new{
                 text = T(_("Progress sync failed: %1"), tostring(err)),
             })
@@ -1880,7 +1905,7 @@ function WebDAVSync:runProgressSync(opts)
             stats.conflicts_skipped, stats.failed))
         if chain_stats then
             self:mergeChainStats(chain_stats, stats, "progress")
-        else
+        elseif (not silent_mode) or stats.failed > 0 then
             self:showProgressSummary(stats)
         end
         release_sync_lock()
