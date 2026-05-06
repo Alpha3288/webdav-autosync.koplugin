@@ -1808,38 +1808,11 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
         return
     end
 
-    local stats = {
-        downloaded = 0,
-        uploaded = 0,
-        unchanged = plan_obj.actions.skipped_unchanged,
-        baselined = plan_obj.actions.baselined,
-        conflicts_skipped = 0,
-        failed = 0,
-        failures = {},
-        downloaded_rels = {},
-    }
+    local stats = init_stats_from_plan(plan_obj)
 
-    for _, a in ipairs(plan_obj.actions.to_download) do
-        local ok, msg = sync.do_action(plan_obj, "download", a)
-        if ok then
-            stats.downloaded = stats.downloaded + 1
-            table.insert(stats.downloaded_rels, a.rel)
-        else
-            stats.failed = stats.failed + 1
-            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
-            logger.warn("webdav_autosync: close-trigger download failed rel=" .. a.rel .. " err=" .. tostring(msg))
-        end
-    end
-    for _, a in ipairs(plan_obj.actions.to_upload) do
-        local ok, msg = sync.do_action(plan_obj, "upload", a)
-        if ok then
-            stats.uploaded = stats.uploaded + 1
-        else
-            stats.failed = stats.failed + 1
-            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
-            logger.warn("webdav_autosync: close-trigger upload failed rel=" .. a.rel .. " err=" .. tostring(msg))
-        end
-    end
+    run_action_loop(plan_obj, stats, function(kind, rel, msg)
+        logger.warn("webdav_autosync: close-trigger " .. kind .. " failed rel=" .. rel .. " err=" .. tostring(msg))
+    end)
 
     local conflicts = plan_obj.actions.conflicts
     local function finish()
