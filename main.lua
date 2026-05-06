@@ -265,21 +265,23 @@ end
 
 -- Stats accumulator for the chain (progress sync → book auto-sync) used
 -- on Resume and on the startup hook in init(). When `chain_stats` is set
--- on a runner call, the runner ADDs its counts here and the per-run
--- summary popup is suppressed; the orchestrator shows ONE merged summary
--- at chain end via `showChainSummary`. Field shape mirrors the per-runner
--- two-way / progress stats so accumulation is straight `+=`. The one-way
--- book-sync runner maps `skipped` → `unchanged` and folds `err` into
--- `failures` (no per-rel breakdown is available there).
+-- on a runner call, the runner stores its counts in the matching section
+-- (`progress` or `books`) and the per-run summary popup is suppressed;
+-- the orchestrator shows ONE merged summary at chain end via
+-- `showChainSummary`, with each sync on its own line so the user can
+-- tell which counts came from which sync.
+--
+-- A nil section means the runner never reported (e.g., reader-context
+-- skip for book auto-sync, in-flight skip, offline). Plan-level failures
+-- still set a section — `mergeChainStats` is called with a synthetic
+-- stats table so the merged summary surfaces the failure.
+--
+-- `downloaded_rels` is union'd across both sections — the post-chain
+-- library-refresh broadcast doesn't care which sync produced which file.
 local function make_empty_chain_stats()
     return {
-        downloaded = 0,
-        uploaded = 0,
-        unchanged = 0,
-        baselined = 0,
-        conflicts_skipped = 0,
-        failed = 0,
-        failures = {},
+        progress = nil,
+        books = nil,
         downloaded_rels = {},
     }
 end
@@ -1204,20 +1206,27 @@ function WebDAVSync:runOneWaySync(ctx)
         downloaded, skipped, failed))
     if chain_stats then
         -- Map one-way fields onto the chain stats schema. one-way has no
-        -- baseline/conflict notion (it's strict download-only) and `err`
-        -- is a single string covering plan/list-level failure rather
-        -- than a per-rel breakdown — fold it as one synthetic entry.
-        chain_stats.downloaded = chain_stats.downloaded + downloaded
-        chain_stats.unchanged = chain_stats.unchanged + skipped
-        chain_stats.failed = chain_stats.failed + failed
+        -- upload / baseline / conflict notion (strict download-only) and
+        -- `err` is a single string covering plan/list-level failure
+        -- rather than a per-rel breakdown — fold it as one synthetic
+        -- failures entry. `failed` stays a per-rel HTTP failure count;
+        -- the synthetic entry from `err` adds to that conceptually but
+        -- isn't counted twice (the section line shows `failed` and the
+        -- failures list at the bottom shows the synthetic message).
+        local failures = {}
         if err then
-            table.insert(chain_stats.failures, _("book sync") .. " (" .. tostring(err) .. ")")
+            table.insert(failures, _("book sync") .. " (" .. tostring(err) .. ")")
         end
-        if downloaded_rels then
-            for _, r in ipairs(downloaded_rels) do
-                table.insert(chain_stats.downloaded_rels, r)
-            end
-        end
+        self:mergeChainStats(chain_stats, {
+            downloaded = downloaded,
+            uploaded = 0,
+            unchanged = skipped,
+            baselined = 0,
+            conflicts_skipped = 0,
+            failed = failed,
+            failures = failures,
+            downloaded_rels = downloaded_rels,
+        }, "books")
     else
         -- Always show whatever counts we have, even on partial failure: a
         -- run that downloaded 4 files and failed on 1 should still report
@@ -1258,8 +1267,15 @@ function WebDAVSync:runTwoWaySync(ctx)
         if syncing_msg then UIManager:close(syncing_msg) end
         logger.warn("webdav_autosync: book sync plan failed: " .. tostring(err))
         if chain_stats then
-            chain_stats.failed = chain_stats.failed + 1
-            table.insert(chain_stats.failures, _("book sync") .. " (" .. tostring(err) .. ")")
+            self:mergeChainStats(chain_stats, {
+                downloaded = 0,
+                uploaded = 0,
+                unchanged = 0,
+                baselined = 0,
+                conflicts_skipped = 0,
+                failed = 1,
+                failures = { _("book sync") .. " (" .. tostring(err) .. ")" },
+            }, "books")
         else
             UIManager:show(InfoMessage:new{
                 text = T(_("Sync failed: %1"), tostring(err)),
@@ -1313,7 +1329,7 @@ function WebDAVSync:runTwoWaySync(ctx)
             stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
             stats.conflicts_skipped, stats.failed))
         if chain_stats then
-            self:mergeChainStats(chain_stats, stats)
+            self:mergeChainStats(chain_stats, stats, "books")
         else
             self:showTwoWaySummary(stats)
         end
@@ -1427,21 +1443,25 @@ function WebDAVSync:notifyLibraryRefresh(local_folder, downloaded_rels)
     UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
 end
 
---- Fold a per-runner stats table (two-way book sync or progress sync —
---- they share the field shape) into the chain accumulator. Plus rels for
---- the eventual library refresh broadcast.
-function WebDAVSync:mergeChainStats(chain_stats, stats)
-    chain_stats.downloaded = chain_stats.downloaded + stats.downloaded
-    chain_stats.uploaded = chain_stats.uploaded + stats.uploaded
-    chain_stats.unchanged = chain_stats.unchanged + (stats.unchanged or 0)
-    chain_stats.baselined = chain_stats.baselined + (stats.baselined or 0)
-    chain_stats.conflicts_skipped = chain_stats.conflicts_skipped + (stats.conflicts_skipped or 0)
-    chain_stats.failed = chain_stats.failed + stats.failed
-    if stats.failures then
-        for _, f in ipairs(stats.failures) do
-            table.insert(chain_stats.failures, f)
-        end
-    end
+--- Store a per-runner stats table into chain_stats under `section`
+--- ("progress" or "books"). Replaces (not adds) — each runner reports
+--- its section once. Downloaded rels are union'd across sections for
+--- the eventual single library-refresh broadcast.
+---
+--- Stats shape from progress / two-way book runners is identical; the
+--- one-way book runner maps its differently-shaped result into a
+--- synthetic stats table at the call site (skipped → unchanged, single
+--- err string → one synthetic failures entry).
+function WebDAVSync:mergeChainStats(chain_stats, stats, section)
+    chain_stats[section] = {
+        downloaded = stats.downloaded,
+        uploaded = stats.uploaded or 0,
+        unchanged = stats.unchanged or 0,
+        baselined = stats.baselined or 0,
+        conflicts_skipped = stats.conflicts_skipped or 0,
+        failed = stats.failed,
+        failures = stats.failures or {},
+    }
     if stats.downloaded_rels then
         for _, r in ipairs(stats.downloaded_rels) do
             table.insert(chain_stats.downloaded_rels, r)
@@ -1449,30 +1469,69 @@ function WebDAVSync:mergeChainStats(chain_stats, stats)
     end
 end
 
---- One merged summary popup for the Resume / startup chain. Same field
---- shape as the per-runner summaries; uses "Sync done." prefix since the
---- combined run covers both reading-progress and book sync.
-function WebDAVSync:showChainSummary(stats)
+--- Build one ", "-joined description line for a chain section. Always
+--- includes downloaded + uploaded; other counts only when non-zero so a
+--- typical no-op run reads "0 downloaded, 0 uploaded" (the user wanted
+--- explicit reassurance the sync ran).
+local function describe_chain_section(section)
     local parts = {}
-    table.insert(parts, T(_("%1 downloaded."), tostring(stats.downloaded)))
-    table.insert(parts, T(_("%1 uploaded."), tostring(stats.uploaded)))
-    if stats.unchanged > 0 then
-        table.insert(parts, T(_("%1 unchanged."), tostring(stats.unchanged)))
+    table.insert(parts, T(_("%1 downloaded"), tostring(section.downloaded)))
+    table.insert(parts, T(_("%1 uploaded"), tostring(section.uploaded)))
+    if section.unchanged > 0 then
+        table.insert(parts, T(_("%1 unchanged"), tostring(section.unchanged)))
     end
-    if stats.baselined > 0 then
-        table.insert(parts, T(_("%1 baselined."), tostring(stats.baselined)))
+    if section.baselined > 0 then
+        table.insert(parts, T(_("%1 baselined"), tostring(section.baselined)))
     end
-    if stats.conflicts_skipped > 0 then
-        table.insert(parts, T(_("%1 conflicts skipped."), tostring(stats.conflicts_skipped)))
+    if section.conflicts_skipped > 0 then
+        table.insert(parts, T(_("%1 conflicts skipped"), tostring(section.conflicts_skipped)))
     end
-    if stats.failed > 0 then
-        table.insert(parts, T(_("%1 failed."), tostring(stats.failed)))
+    if section.failed > 0 then
+        table.insert(parts, T(_("%1 failed"), tostring(section.failed)))
     end
-    local text = _("Sync done.") .. " " .. table.concat(parts, " ")
-    if stats.failed > 0 and #stats.failures > 0 then
-        text = text .. "\n\n" .. table.concat(stats.failures, "\n")
+    return table.concat(parts, ", ")
+end
+
+--- Merged summary popup for the Resume / startup chain. Each sync gets
+--- its own line so the user can see which counts belong to which; any
+--- per-rel failure messages from either section are listed once at the
+--- bottom under a "Failures:" heading. Sections that didn't run (nil)
+--- are omitted.
+function WebDAVSync:showChainSummary(stats)
+    local lines = { _("Sync done.") }
+
+    local has_section = false
+    if stats.progress then
+        has_section = true
+        table.insert(lines, "")
+        table.insert(lines, _("Reading progress sync:") .. " " .. describe_chain_section(stats.progress) .. ".")
     end
-    UIManager:show(InfoMessage:new{ text = text })
+    if stats.books then
+        if not has_section then table.insert(lines, "") end
+        has_section = true
+        table.insert(lines, _("Book sync:") .. " " .. describe_chain_section(stats.books) .. ".")
+    end
+
+    local failures = {}
+    if stats.progress and stats.progress.failures then
+        for _, f in ipairs(stats.progress.failures) do
+            table.insert(failures, f)
+        end
+    end
+    if stats.books and stats.books.failures then
+        for _, f in ipairs(stats.books.failures) do
+            table.insert(failures, f)
+        end
+    end
+    if #failures > 0 then
+        table.insert(lines, "")
+        table.insert(lines, _("Failures:"))
+        for _, f in ipairs(failures) do
+            table.insert(lines, "  " .. f)
+        end
+    end
+
+    UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n") })
 end
 
 function WebDAVSync:showTwoWaySummary(stats)
@@ -1758,8 +1817,15 @@ function WebDAVSync:runProgressSync(opts)
         if syncing_msg then UIManager:close(syncing_msg) end
         logger.warn("webdav_autosync: progress plan failed: " .. tostring(err))
         if chain_stats then
-            chain_stats.failed = chain_stats.failed + 1
-            table.insert(chain_stats.failures, _("progress sync") .. " (" .. tostring(err) .. ")")
+            self:mergeChainStats(chain_stats, {
+                downloaded = 0,
+                uploaded = 0,
+                unchanged = 0,
+                baselined = 0,
+                conflicts_skipped = 0,
+                failed = 1,
+                failures = { _("progress sync") .. " (" .. tostring(err) .. ")" },
+            }, "progress")
         else
             UIManager:show(InfoMessage:new{
                 text = T(_("Progress sync failed: %1"), tostring(err)),
@@ -1813,7 +1879,7 @@ function WebDAVSync:runProgressSync(opts)
             stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
             stats.conflicts_skipped, stats.failed))
         if chain_stats then
-            self:mergeChainStats(chain_stats, stats)
+            self:mergeChainStats(chain_stats, stats, "progress")
         else
             self:showProgressSummary(stats)
         end
