@@ -757,15 +757,21 @@ function WebDAVSync:runResumeSync(retries_left, opts)
     logger.info(string.format(
         "webdav_autosync: trigger=resume progress=%s books=%s",
         tostring(progress_on), tostring(books_on)))
+    -- On Resume, suppress per-sync "Syncing…" InfoMessages; the user just
+    -- woke the device and we don't want to barge in with a popup. Summaries
+    -- still surface at the end.
     if progress_on then
         self:doProgressSync({
             trigger = "resume",
+            show_syncing_message = false,
             on_done = function()
-                if books_on then self:maybeRunBookAutoSync() end
+                if books_on then
+                    self:maybeRunBookAutoSync({ show_syncing_message = false })
+                end
             end,
         })
     else
-        self:maybeRunBookAutoSync()
+        self:maybeRunBookAutoSync({ show_syncing_message = false })
     end
 end
 
@@ -1040,6 +1046,10 @@ function WebDAVSync:doSync(opts)
     opts = opts or {}
     local is_auto = opts.is_auto
     local turn_off_wifi = opts.turn_off_wifi
+    -- Default true for manual / startup; runResumeSync passes false on wake
+    -- so the InfoMessage doesn't barge in just as the user picks the device
+    -- up. The summary popup still fires.
+    local show_syncing_message = opts.show_syncing_message ~= false
 
     if check_in_flight("book sync", not is_auto) then return end
 
@@ -1103,6 +1113,7 @@ function WebDAVSync:doSync(opts)
         file_extensions = file_extensions,
         is_auto = is_auto,
         turn_off_wifi = turn_off_wifi,
+        show_syncing_message = show_syncing_message,
     }
     if two_way then
         logger.info("webdav_autosync: book sync start mode=two_way is_auto=" .. tostring(is_auto == true))
@@ -1115,13 +1126,17 @@ end
 
 function WebDAVSync:runOneWaySync(ctx)
     acquire_sync_lock()
-    local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
-    UIManager:show(syncing_msg)
-    UIManager:forceRePaint()
+    local show_msg = ctx.show_syncing_message ~= false
+    local syncing_msg
+    if show_msg then
+        syncing_msg = InfoMessage:new{ text = _("Syncing…") }
+        UIManager:show(syncing_msg)
+        UIManager:forceRePaint()
+    end
     local downloaded, skipped, failed, err, downloaded_rels = sync.run_sync(
             ctx.server_url, ctx.username, ctx.password,
             ctx.folder, nil, ctx.file_extensions)
-    UIManager:close(syncing_msg)
+    if syncing_msg then UIManager:close(syncing_msg) end
     logger.info(string.format(
         "webdav_autosync: book sync done mode=one_way downloaded=%d skipped=%d failed=%d",
         downloaded, skipped, failed))
@@ -1147,14 +1162,18 @@ end
 
 function WebDAVSync:runTwoWaySync(ctx)
     acquire_sync_lock()
-    local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
-    UIManager:show(syncing_msg)
-    UIManager:forceRePaint()
+    local show_msg = ctx.show_syncing_message ~= false
+    local syncing_msg
+    if show_msg then
+        syncing_msg = InfoMessage:new{ text = _("Syncing…") }
+        UIManager:show(syncing_msg)
+        UIManager:forceRePaint()
+    end
 
     local plan_obj, err = sync.plan(ctx.server_url, ctx.username, ctx.password,
             ctx.folder, ctx.file_extensions)
     if not plan_obj then
-        UIManager:close(syncing_msg)
+        if syncing_msg then UIManager:close(syncing_msg) end
         logger.warn("webdav_autosync: book sync plan failed: " .. tostring(err))
         UIManager:show(InfoMessage:new{
             text = T(_("Sync failed: %1"), tostring(err)),
@@ -1195,7 +1214,7 @@ function WebDAVSync:runTwoWaySync(ctx)
         end
     end
 
-    UIManager:close(syncing_msg)
+    if syncing_msg then UIManager:close(syncing_msg) end
 
     local conflicts = plan_obj.actions.conflicts
     local function finish()
@@ -1355,7 +1374,10 @@ end
 --- cooldown and per-event toggles are enforced by the event handler before
 --- this is called, so we don't re-check them here. File-manager-only — a
 --- full library scan inside a reader context would be disruptive.
-function WebDAVSync:maybeRunBookAutoSync()
+--- opts.show_syncing_message: forwarded to doSync; default true. Resume
+---                            passes false so the wake event doesn't barge in.
+function WebDAVSync:maybeRunBookAutoSync(opts)
+    opts = opts or {}
     if self.ui.document then
         logger.dbg("webdav_autosync: book auto-sync skip reason=reader-context")
         return
@@ -1367,7 +1389,10 @@ function WebDAVSync:maybeRunBookAutoSync()
         return
     end
 
-    self:doSync({ is_auto = true })
+    self:doSync({
+        is_auto = true,
+        show_syncing_message = opts.show_syncing_message,
+    })
 end
 
 --- Full-library progress (`.sdr` sidecar) sync. Always interactive in the
@@ -1386,6 +1411,7 @@ function WebDAVSync:doProgressSync(opts)
     opts = opts or {}
     local manual = opts.manual == true
     local on_done = opts.on_done
+    local show_syncing_message = opts.show_syncing_message ~= false
     local function done() if on_done then on_done() end end
 
     if check_in_flight("progress sync", manual) then return done() end
@@ -1439,6 +1465,7 @@ function WebDAVSync:doProgressSync(opts)
             server_url = server_url,
             local_folder = local_folder,
             on_done = on_done,
+            show_syncing_message = show_syncing_message,
         })
         return
     end
@@ -1461,6 +1488,7 @@ function WebDAVSync:doProgressSync(opts)
         server_url = server_url,
         local_folder = local_folder,
         on_done = on_done,
+        show_syncing_message = show_syncing_message,
     })
 end
 
@@ -1543,30 +1571,34 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
     release_sync_lock()
 end
 
---- Run a full-library progress sync. Always interactive: shows the
---- syncing InfoMessage, surfaces plan errors, runs the conflict dialog
---- chain, and shows a summary at the end. Silent close-trigger syncs go
---- through doProgressSyncForBook instead, so this path never needs a
---- "silent" mode. All current entry points (init, onResume, manual menu,
---- WebDAVProgressSyncNow Dispatcher action) reach here interactively.
+--- Run a full-library progress sync. Surfaces plan errors, runs the
+--- conflict dialog chain, and shows a summary at the end. The "Syncing
+--- reading progress…" InfoMessage is gated on opts.show_syncing_message
+--- (default true) — Resume passes false so the wake event doesn't barge
+--- in with a popup; the per-run summary still fires. Silent close-trigger
+--- syncs go through doProgressSyncForBook instead.
 function WebDAVSync:runProgressSync(opts)
     local server_url = opts.server_url
     local local_folder = opts.local_folder
     local on_done = opts.on_done
+    local show_msg = opts.show_syncing_message ~= false
     local function done() if on_done then on_done() end end
 
     acquire_sync_lock()
     local username = self:getSetting("username", "")
     local password = self:getSetting("password", "")
 
-    local syncing_msg = InfoMessage:new{ text = _("Syncing reading progress…") }
-    UIManager:show(syncing_msg)
-    UIManager:forceRePaint()
+    local syncing_msg
+    if show_msg then
+        syncing_msg = InfoMessage:new{ text = _("Syncing reading progress…") }
+        UIManager:show(syncing_msg)
+        UIManager:forceRePaint()
+    end
 
     logger.info("webdav_autosync: progress sync start")
     local plan_obj, err = sync.plan_progress(server_url, username, password, local_folder)
     if not plan_obj then
-        UIManager:close(syncing_msg)
+        if syncing_msg then UIManager:close(syncing_msg) end
         logger.warn("webdav_autosync: progress plan failed: " .. tostring(err))
         UIManager:show(InfoMessage:new{
             text = T(_("Progress sync failed: %1"), tostring(err)),
@@ -1608,7 +1640,7 @@ function WebDAVSync:runProgressSync(opts)
         end
     end
 
-    UIManager:close(syncing_msg)
+    if syncing_msg then UIManager:close(syncing_msg) end
 
     local conflicts = plan_obj.actions.conflicts
     local function finish()
