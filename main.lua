@@ -1723,12 +1723,20 @@ function WebDAVSync:doProgressSync(opts)
     })
 end
 
---- Silent scoped progress sync for one just-closed book. Called from
+--- Scoped progress sync for one just-closed book. Called from
 --- onCloseDocument after the per-book debounce passes. One PROPFIND on
---- `<book>.sdr/`, executes non-conflicting actions, leaves any conflicts
---- pending (they'll surface at the next interactive trigger). Same gates
---- as doProgressSync: the toggle, the `doc` metadata-folder requirement,
---- server/folder configured, online.
+--- `<book>.sdr/`, executes non-conflicting actions, runs the conflict
+--- dialog chain if needed, and surfaces a summary popup ONLY on failure.
+--- Same gates as doProgressSync: the toggle, the `doc` metadata-folder
+--- requirement, server/folder configured, online.
+---
+--- Auto-trigger UI policy (silent_mode): silent on success, popup only
+--- on failure. Conflicts now surface immediately via the same dialog
+--- chain as the interactive triggers — they're no longer deferred.
+--- Pre-1.8.0 the close trigger swallowed conflicts and left them for
+--- the next Resume/startup; the user asked for them to be surfaced now
+--- so the change is visible at the moment they happen (the user just
+--- closed the book; a dialog right after is cheap).
 function WebDAVSync:doProgressSyncForBook(book_rel)
     -- Gating (master + progress_on_close) is enforced by onCloseDocument
     -- before this runs; we don't re-check here.
@@ -1767,39 +1775,71 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
     local plan_obj, err = sync.plan_progress_book(server_url, username, password, local_folder, book_rel)
     if not plan_obj then
         logger.warn("webdav_autosync: close-trigger plan failed book=" .. tostring(book_rel) .. " err=" .. tostring(err))
+        -- Plan failure is *always* surfaced — the user needs to know the
+        -- close-trigger sync didn't run. Same policy as the other runners.
+        UIManager:show(InfoMessage:new{
+            text = T(_("Progress sync failed: %1"), tostring(err)),
+        })
         release_sync_lock()
         return
     end
 
-    local downloaded, uploaded, failed = 0, 0, 0
-    local downloaded_rels = {}
+    local stats = {
+        downloaded = 0,
+        uploaded = 0,
+        unchanged = plan_obj.actions.skipped_unchanged,
+        baselined = plan_obj.actions.baselined,
+        conflicts_skipped = 0,
+        failed = 0,
+        failures = {},
+        downloaded_rels = {},
+    }
+
     for _, a in ipairs(plan_obj.actions.to_download) do
         local ok, msg = sync.do_action(plan_obj, "download", a)
         if ok then
-            downloaded = downloaded + 1
-            table.insert(downloaded_rels, a.rel)
+            stats.downloaded = stats.downloaded + 1
+            table.insert(stats.downloaded_rels, a.rel)
         else
-            failed = failed + 1
+            stats.failed = stats.failed + 1
+            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
             logger.warn("webdav_autosync: close-trigger download failed rel=" .. a.rel .. " err=" .. tostring(msg))
         end
     end
     for _, a in ipairs(plan_obj.actions.to_upload) do
         local ok, msg = sync.do_action(plan_obj, "upload", a)
         if ok then
-            uploaded = uploaded + 1
+            stats.uploaded = stats.uploaded + 1
         else
-            failed = failed + 1
+            stats.failed = stats.failed + 1
+            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
             logger.warn("webdav_autosync: close-trigger upload failed rel=" .. a.rel .. " err=" .. tostring(msg))
         end
     end
-    sync.save_cache(plan_obj)
-    self:notifyLibraryRefresh(plan_obj.local_folder, downloaded_rels)
-    logger.info(string.format(
-        "webdav_autosync: close-trigger sync done book=%s downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts=%d failed=%d",
-        tostring(book_rel), downloaded, uploaded,
-        plan_obj.actions.skipped_unchanged, plan_obj.actions.baselined,
-        #plan_obj.actions.conflicts, failed))
-    release_sync_lock()
+
+    local conflicts = plan_obj.actions.conflicts
+    local function finish()
+        sync.save_cache(plan_obj)
+        self:notifyLibraryRefresh(plan_obj.local_folder, stats.downloaded_rels)
+        logger.info(string.format(
+            "webdav_autosync: close-trigger sync done book=%s downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
+            tostring(book_rel), stats.downloaded, stats.uploaded,
+            stats.unchanged, stats.baselined,
+            stats.conflicts_skipped, stats.failed))
+        -- silent_mode policy: summary popup only when something failed.
+        if stats.failed > 0 then
+            self:showProgressSummary(stats)
+        end
+        release_sync_lock()
+    end
+
+    if #conflicts == 0 then
+        finish()
+        return
+    end
+
+    logger.info("webdav_autosync: close-trigger sync surfacing conflicts count=" .. tostring(#conflicts))
+    self:resolveConflictsInteractive(plan_obj, conflicts, stats, finish)
 end
 
 --- Run a full-library progress sync. Surfaces plan errors, runs the
