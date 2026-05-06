@@ -296,6 +296,57 @@ local function chain_total_failed(chain_stats)
     return n
 end
 
+-- Per-runner stats accumulator initialized from a fresh plan_obj. The
+-- plan tells us up front how many entries were classified as
+-- skipped_unchanged or baselined; everything else starts at zero and is
+-- bumped by run_action_loop / resolveConflictsInteractive. Used by
+-- runTwoWaySync, runProgressSync, doProgressSyncForBook (the three
+-- "planned" runners). runOneWaySync has its own shape (sync.run_sync
+-- returns counts directly).
+local function init_stats_from_plan(plan_obj)
+    return {
+        downloaded = 0,
+        uploaded = 0,
+        unchanged = plan_obj.actions.skipped_unchanged,
+        baselined = plan_obj.actions.baselined,
+        conflicts_skipped = 0,
+        failed = 0,
+        failures = {},
+        downloaded_rels = {},
+    }
+end
+
+-- Iterate the planner's to_download and to_upload action arrays,
+-- mutating `stats` in place. Per-rel HTTP failures populate
+-- stats.failures with "<rel> (<msg>)" strings — same format the
+-- conflict resolver uses, so the merged display is consistent.
+-- on_action_failure is an optional callback (kind, rel, msg) → ()
+-- used by the close-trigger runner to emit logger.warn lines per
+-- failure (it has no other UI surface for them).
+local function run_action_loop(plan_obj, stats, on_action_failure)
+    for _, a in ipairs(plan_obj.actions.to_download) do
+        local ok, msg = sync.do_action(plan_obj, "download", a)
+        if ok then
+            stats.downloaded = stats.downloaded + 1
+            table.insert(stats.downloaded_rels, a.rel)
+        else
+            stats.failed = stats.failed + 1
+            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
+            if on_action_failure then on_action_failure("download", a.rel, msg) end
+        end
+    end
+    for _, a in ipairs(plan_obj.actions.to_upload) do
+        local ok, msg = sync.do_action(plan_obj, "upload", a)
+        if ok then
+            stats.uploaded = stats.uploaded + 1
+        else
+            stats.failed = stats.failed + 1
+            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
+            if on_action_failure then on_action_failure("upload", a.rel, msg) end
+        end
+    end
+end
+
 local function defer_until_online(label, retries_left, retry_fn)
     local NetworkMgr = require("ui/network/manager")
     -- isOnline() is just a DNS probe (canResolveHostnames at
@@ -1307,36 +1358,9 @@ function WebDAVSync:runTwoWaySync(ctx)
         return
     end
 
-    local stats = {
-        downloaded = 0,
-        uploaded = 0,
-        unchanged = plan_obj.actions.skipped_unchanged,
-        baselined = plan_obj.actions.baselined,
-        conflicts_skipped = 0,
-        failed = 0,
-        failures = {},
-        downloaded_rels = {},
-    }
+    local stats = init_stats_from_plan(plan_obj)
 
-    for _, a in ipairs(plan_obj.actions.to_download) do
-        local ok, msg = sync.do_action(plan_obj, "download", a)
-        if ok then
-            stats.downloaded = stats.downloaded + 1
-            table.insert(stats.downloaded_rels, a.rel)
-        else
-            stats.failed = stats.failed + 1
-            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
-        end
-    end
-    for _, a in ipairs(plan_obj.actions.to_upload) do
-        local ok, msg = sync.do_action(plan_obj, "upload", a)
-        if ok then
-            stats.uploaded = stats.uploaded + 1
-        else
-            stats.failed = stats.failed + 1
-            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
-        end
-    end
+    run_action_loop(plan_obj, stats)
 
     if syncing_msg then UIManager:close(syncing_msg) end
 
