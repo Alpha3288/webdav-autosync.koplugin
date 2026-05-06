@@ -57,6 +57,7 @@ flowchart TD
 - **Close** is cheap (one network request, scoped to the just-closed book) and has its own short cooldown — separate from the wake/startup one. Closing book A then book B fires twice (different `.sdr/`); closing book A then book A again within the close cooldown is debounced.
 - **Wake** and **Startup** share the auto sync cooldown — they're the catch-up moments when full library reconciles happen and any held conflicts are surfaced. At each, only the syncs whose toggles are on actually run; if both *progress* and *books* on-startup are on, progress runs first and books chain after.
 - **Manual** triggers always run, and they reset the auto sync cooldown so a wake/startup trigger right after won't fire redundantly. Manual does not reset the close cooldown.
+- **Wake has a 15 s settle delay before the sync UI appears.** The device's framework can wake the CPU briefly for its own background tasks (RTC alarms, leather-cover hall sensor twitching, Wi-Fi housekeeping) without the user actually picking the device up; the delay lets those go back to sleep without burning a sync. On Kindle the plugin reads the framework's own wake classification at the end of the delay; on other platforms it relies on the device re-suspending before the timer fires. Real wakes proceed as normal once the 15 s elapse. Startup, close, and manual triggers are not delayed.
 - The two cooldowns are independent: a close-triggered sync does not push back the next wake/startup reconcile, and vice versa. Defaults are **300 s** for wake/startup (*Auto sync cooldown*) and **30 s** for the close trigger (*Close-trigger sync cooldown*); both are in the *Auto sync triggers* submenu, both accept 0 to disable.
 - Cooldown timestamps are persisted across KOReader restarts (in the plugin's state file alongside the per-file sync cache), so killing and reopening KOReader within the cooldown window won't bypass it.
 - Conflicts produced by a silent close are stored without dialog and shown the next time an interactive trigger runs.
@@ -108,7 +109,9 @@ Sync downloads **all files** under the server URL recursively; subfolders are re
 
 ## Troubleshooting
 
-Every log line emitted by the plugin starts with `webdav_autosync:`, so a single `grep webdav_autosync /path/to/koreader/crash.log` surfaces the full trail. By default you'll see info-level entries — trigger names (`trigger=close|resume|startup|manual_*`), sync start, and sync done with counts. Enable **Tools → More tools → Developer options → Enable debug logging** before reproducing to also capture per-file diff decisions, per-action HTTP outcomes, gating reasons (cooldown, toggle off, offline, etc.), and individual WebDAV requests.
+Every log line emitted by the plugin starts with `webdav_autosync:`, so a single `grep webdav_autosync /path/to/koreader/crash.log` surfaces the full trail. By default you'll see info-level entries — trigger names (`trigger=close|resume|startup|manual_*`), sync start, and sync done with counts. Enable **Tools → More tools → Developer options → Enable debug logging** before reproducing to also capture per-file diff decisions, per-action HTTP outcomes, gating reasons (cooldown, toggle off, offline, brief unscheduled wake, etc.), and individual WebDAV requests.
+
+If you suspect the wake trigger is being suppressed too aggressively, the relevant debug lines are `trigger=resume defer secs=15` (sync deferred), `trigger=resume cancelled reason=suspend` (device went back to sleep before the delay elapsed), and `trigger=resume skip reason=unscheduled-wake state=…` (Kindle: framework reported the wake was a brief system one). A real user wake will instead reach `trigger=resume progress=… books=…` after the 15 s delay.
 
 ## Requirements
 

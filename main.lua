@@ -175,6 +175,71 @@ end
 local AUTO_TRIGGER_NET_RETRY_INTERVAL_SECS = 5
 local AUTO_TRIGGER_NET_RETRY_MAX = 6  -- ~30 s total
 
+-- Resume settle delay. Resume on Kindle (and likely other lipc-driven
+-- platforms) fires for *every* powerd-reported wake, including the brief
+-- unscheduled wakes the system schedules for its own background tasks
+-- (RTC alarms, hall-sensor twitches, USB/network housekeeping). Without
+-- a settle delay, our sync runs in those tiny wake windows and burns
+-- the cooldown for nothing.
+--
+-- KOReader's own classifier (frontend/device/kindle/powerd.lua:258-269,
+-- `KindlePowerD:checkUnexpectedWakeup`) waits 15 s after wakeup and reads
+-- `getPowerdState()`: if state is still "screenSaver" or "suspended", the
+-- wake was unscheduled. We mirror that window here.
+--
+-- Two complementary mechanisms gate at fire time:
+--   1. Cross-platform — onSuspend cancels the pending defer before it
+--      fires. On Kindle the back-to-sleep edge after a brief unscheduled
+--      wake usually goes screenSaver → suspended without firing
+--      `goingToScreenSaver`, so onSuspend may not fire; in that case the
+--      CPU is suspended before our scheduled task can run. Either way,
+--      the deferred fn does not execute while the device is asleep.
+--   2. Kindle-only — at fire time, read powerd state. If it's still
+--      "screenSaver" or "suspended" 15 s after Resume, the wake was
+--      unscheduled and we explicitly skip (see is_unscheduled_kindle_wake).
+local RESUME_SETTLE_SECS = 15
+
+-- Module-local because the plugin is instantiated twice (FileManager and
+-- ReaderUI). Resume / Suspend broadcast to both instances; we want a single
+-- shared pending fn so the second instance's onResume sees that one is
+-- already scheduled, and either instance's onSuspend can cancel it.
+local pending_resume_sync_fn = nil
+
+-- Read Kindle's powerd state via `KindlePowerD:getPowerdState()` (a
+-- thin wrapper around `lipc.get_string_property("com.lab126.powerd",
+-- "state")`). Returns nil on non-Kindle, when lipc isn't available, or
+-- on error. The state strings we care about are "screenSaver" and
+-- "suspended" — anything else (e.g. "active", "ready") means the user
+-- has actually engaged with the device.
+local function read_powerd_state()
+    local ok_dev, Device = pcall(require, "device")
+    if not ok_dev or not Device then return nil end
+    if not Device.isKindle or not Device:isKindle() then return nil end
+    local powerd = Device.getPowerDevice and Device:getPowerDevice()
+    if not powerd or not powerd.getPowerdState then return nil end
+    local ok, state = pcall(function() return powerd:getPowerdState() end)
+    if not ok then return nil end
+    return state
+end
+
+-- True iff we're on Kindle AND powerd reports the device is back in
+-- screensaver/suspended after the settle delay — the canonical "this
+-- was an unscheduled wake" signal. Non-Kindle devices fall through
+-- (read_powerd_state returns nil → returns false; the cross-platform
+-- defer/cancel mechanism is the only gate there).
+local function is_unscheduled_kindle_wake()
+    local state = read_powerd_state()
+    if state == nil then return false end
+    return state == "screenSaver" or state == "suspended"
+end
+
+local function cancel_pending_resume_sync(reason)
+    if not pending_resume_sync_fn then return end
+    UIManager:unschedule(pending_resume_sync_fn)
+    pending_resume_sync_fn = nil
+    logger.dbg("webdav_autosync: trigger=resume cancelled reason=" .. reason)
+end
+
 local function defer_until_online(label, retries_left, retry_fn)
     local NetworkMgr = require("ui/network/manager")
     -- isOnline() is just a DNS probe (canResolveHostnames at
@@ -560,8 +625,54 @@ end
 -- up here as dialogs. We chain progress → book auto-sync via on_done so the
 -- two dialog chains can't end up stacked on screen at the same time; book
 -- sync starts only once progress sync has fully resolved its conflicts.
--- Cooldown is consumed up here so the chain counts as a single auto slot.
-function WebDAVSync:onResume(retries_left)
+-- Cooldown is consumed in runResumeSync so the chain counts as a single auto
+-- slot.
+--
+-- Resume defers the actual sync work by RESUME_SETTLE_SECS to filter out
+-- brief unscheduled wakes (see comment on RESUME_SETTLE_SECS). The cheap
+-- toggle gate runs here so we don't even schedule when both sync types are
+-- off. Toggles, cooldown, and the Kindle powerd-state gate all re-run at
+-- fire time in runResumeSync — they may have changed during the wait.
+function WebDAVSync:onResume()
+    local progress_on = event_enabled("progress_on_resume")
+    local books_on = event_enabled("books_on_resume")
+    if not progress_on and not books_on then
+        logger.dbg("webdav_autosync: trigger=resume skip reason=disabled")
+        return
+    end
+    -- Both plugin instances (FM and Reader) receive Resume; collapse to a
+    -- single pending defer. Repeated Resume broadcasts inside the settle
+    -- window (e.g. unscheduled wake → real user wake before t+15) leave
+    -- the original defer in place; whichever wake is "real" will pass the
+    -- fire-time Kindle state gate.
+    if pending_resume_sync_fn then
+        logger.dbg("webdav_autosync: trigger=resume skip reason=already-scheduled")
+        return
+    end
+    local fn
+    fn = function()
+        pending_resume_sync_fn = nil
+        self:runResumeSync()
+    end
+    pending_resume_sync_fn = fn
+    logger.dbg("webdav_autosync: trigger=resume defer secs=" .. tostring(RESUME_SETTLE_SECS))
+    UIManager:scheduleIn(RESUME_SETTLE_SECS, fn)
+end
+
+-- Cancel any pending deferred Resume sync if the device suspends again
+-- before the settle delay elapses. Does NOT initiate any sync work — the
+-- onSuspend handler exists solely as the cancel hook for the Resume
+-- defer. Don't reintroduce a sync-on-suspend codepath here.
+function WebDAVSync:onSuspend()
+    cancel_pending_resume_sync("suspend")
+end
+
+-- Fire-time gating + sync. Re-checks toggles and cooldown (they may have
+-- changed in the settle window) and applies the Kindle unscheduled-wake
+-- gate, then enters the existing online-defer / sync chain. The retries
+-- arg threads through online-defer's recursive callback; KOReader's
+-- Resume broadcast has no payload, so onResume itself doesn't take it.
+function WebDAVSync:runResumeSync(retries_left)
     local progress_on = event_enabled("progress_on_resume")
     local books_on = event_enabled("books_on_resume")
     if not progress_on and not books_on then
@@ -572,9 +683,20 @@ function WebDAVSync:onResume(retries_left)
         logger.dbg("webdav_autosync: trigger=resume skip reason=cooldown")
         return
     end
+    -- Kindle-only: the settle delay matches KindlePowerD's own classifier
+    -- window, so reading powerd state here gives the same verdict KOReader
+    -- itself uses for `Kindle (un)scheduled wakeup` — no inference needed.
+    -- Non-Kindle devices fall through (state==nil); they're protected by
+    -- the cross-platform defer + onSuspend cancel + CPU-suspended-during-
+    -- sleep mechanism.
+    if is_unscheduled_kindle_wake() then
+        logger.dbg("webdav_autosync: trigger=resume skip reason=unscheduled-wake state="
+            .. tostring(read_powerd_state()))
+        return
+    end
     if defer_until_online("trigger=resume",
         retries_left or AUTO_TRIGGER_NET_RETRY_MAX,
-        function(n) self:onResume(n) end) then
+        function(n) self:runResumeSync(n) end) then
         return
     end
     mark_auto_run()
