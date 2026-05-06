@@ -1375,7 +1375,7 @@ function WebDAVSync:runTwoWaySync(ctx)
         if chain_stats then
             self:mergeChainStats(chain_stats, stats, "books")
         elseif (not silent_mode) or stats.failed > 0 then
-            self:showTwoWaySummary(stats)
+            self:showSummary(_("Sync done."), stats)
         end
         self:turnOffWifiIfRequested(ctx)
         release_sync_lock()
@@ -1578,7 +1578,7 @@ function WebDAVSync:showChainSummary(stats)
     UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n") })
 end
 
-function WebDAVSync:showTwoWaySummary(stats)
+function WebDAVSync:showSummary(prefix, stats)
     local parts = {}
     table.insert(parts, T(_("%1 downloaded."), tostring(stats.downloaded)))
     table.insert(parts, T(_("%1 uploaded."), tostring(stats.uploaded)))
@@ -1594,7 +1594,7 @@ function WebDAVSync:showTwoWaySummary(stats)
     if stats.failed > 0 then
         table.insert(parts, T(_("%1 failed."), tostring(stats.failed)))
     end
-    local text = _("Sync done.") .. " " .. table.concat(parts, " ")
+    local text = prefix .. " " .. table.concat(parts, " ")
     if stats.failed > 0 and #stats.failures > 0 then
         text = text .. "\n\n" .. table.concat(stats.failures, "\n")
     end
@@ -1825,7 +1825,7 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
             stats.conflicts_skipped, stats.failed))
         -- silent_mode policy: summary popup only when something failed.
         if stats.failed > 0 then
-            self:showProgressSummary(stats)
+            self:showSummary(_("Reading progress synced."), stats)
         end
         release_sync_lock()
     end
@@ -1917,7 +1917,7 @@ function WebDAVSync:runProgressSync(opts)
         if chain_stats then
             self:mergeChainStats(chain_stats, stats, "progress")
         elseif (not silent_mode) or stats.failed > 0 then
-            self:showProgressSummary(stats)
+            self:showSummary(_("Reading progress synced."), stats)
         end
         release_sync_lock()
         done()
@@ -1985,29 +1985,6 @@ NOTES
         title = _("WebDAV Sync — help"),
         text = text,
     })
-end
-
-function WebDAVSync:showProgressSummary(stats)
-    local parts = {}
-    table.insert(parts, T(_("%1 downloaded."), tostring(stats.downloaded)))
-    table.insert(parts, T(_("%1 uploaded."), tostring(stats.uploaded)))
-    if stats.unchanged > 0 then
-        table.insert(parts, T(_("%1 unchanged."), tostring(stats.unchanged)))
-    end
-    if stats.baselined > 0 then
-        table.insert(parts, T(_("%1 baselined."), tostring(stats.baselined)))
-    end
-    if stats.conflicts_skipped > 0 then
-        table.insert(parts, T(_("%1 conflicts skipped."), tostring(stats.conflicts_skipped)))
-    end
-    if stats.failed > 0 then
-        table.insert(parts, T(_("%1 failed."), tostring(stats.failed)))
-    end
-    local text = _("Reading progress synced.") .. " " .. table.concat(parts, " ")
-    if stats.failed > 0 and #stats.failures > 0 then
-        text = text .. "\n\n" .. table.concat(stats.failures, "\n")
-    end
-    UIManager:show(InfoMessage:new{ text = text })
 end
 
 return WebDAVSync
