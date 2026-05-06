@@ -1924,38 +1924,12 @@ function WebDAVSync:runProgressSync(opts)
         return done()
     end
 
-    local stats = {
-        downloaded = 0,
-        uploaded = 0,
-        unchanged = plan_obj.actions.skipped_unchanged,
-        baselined = plan_obj.actions.baselined,
-        conflicts_skipped = 0,
-        failed = 0,
-        failures = {},
-        -- resolveConflictsInteractive appends conflict-resolved downloads here
-        -- when present; we feed the whole list to notifyLibraryRefresh.
-        downloaded_rels = {},
-    }
+    -- resolveConflictsInteractive appends conflict-resolved downloads to
+    -- stats.downloaded_rels when present; we feed the whole list to
+    -- notifyLibraryRefresh.
+    local stats = init_stats_from_plan(plan_obj)
 
-    for _, a in ipairs(plan_obj.actions.to_download) do
-        local ok, msg = sync.do_action(plan_obj, "download", a)
-        if ok then
-            stats.downloaded = stats.downloaded + 1
-            table.insert(stats.downloaded_rels, a.rel)
-        else
-            stats.failed = stats.failed + 1
-            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
-        end
-    end
-    for _, a in ipairs(plan_obj.actions.to_upload) do
-        local ok, msg = sync.do_action(plan_obj, "upload", a)
-        if ok then
-            stats.uploaded = stats.uploaded + 1
-        else
-            stats.failed = stats.failed + 1
-            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
-        end
-    end
+    run_action_loop(plan_obj, stats)
 
     if syncing_msg then UIManager:close(syncing_msg) end
 
