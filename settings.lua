@@ -161,8 +161,6 @@ return {
     save = save,
     is_master_on = is_master_on,
     event_enabled = event_enabled,
-    read_state = read_state,
-    write_state = write_state,
     should_run_auto = should_run_auto,
     should_run_close = should_run_close,
     mark_auto_run = mark_auto_run,
