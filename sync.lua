@@ -782,6 +782,10 @@ local function do_action(p, kind, action)
     return nil, "unknown action"
 end
 
+-- Writes only the `files` key; settings.lua writes only the timestamp keys
+-- on the same file. Safety against clobbering relies on Lua being
+-- cooperative single-threaded — see the concurrency note in settings.lua's
+-- read_state/write_state. Don't introduce yields between open and flush.
 local function save_cache(p)
     if not p or not p.cache then return end
     p.cache:saveSetting("files", p.cache_files)

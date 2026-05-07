@@ -94,6 +94,16 @@ end
 -- immediately on write so cooldown timestamps survive abrupt termination.
 -- The shared file format is documented in CLAUDE.md → "Trigger taxonomy
 -- and cooldowns".
+--
+-- Concurrency invariant (read this before adding async work to the path):
+-- this module writes only the timestamp keys (`last_auto_run_at`,
+-- `last_close_run_at`, `last_close_book_rel`); sync.lua's planner cache
+-- writes only the `files` key. Both modules open fresh LuaSettings
+-- instances against the same file. Safety relies on Lua being
+-- cooperative single-threaded and on each `:open ... :flush` being
+-- yield-free — a yield between open and flush in either module would
+-- let a second writer commit its read-modified state, dropping the
+-- first writer's keys on the second flush. Don't introduce yields here.
 local function read_state(key)
     local s = LuaSettings:open(STATE_FILE_PATH)
     return s:readSetting(key)
