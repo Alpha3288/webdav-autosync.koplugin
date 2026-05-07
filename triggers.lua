@@ -27,6 +27,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local logger = require("logger")
 local _ = require("gettext")
 local settings = require("settings")
+local runner = require("runner")
 
 local AUTO_TRIGGER_NET_RETRY_INTERVAL_SECS = 5
 local AUTO_TRIGGER_NET_RETRY_MAX = 6  -- ~30 s total
@@ -110,7 +111,7 @@ local function dispatch_auto_chain(opts)
     local progress_on = opts.progress_on
     local books_on = opts.books_on
     if progress_on and books_on then
-        local chain_stats = plugin:make_empty_chain_stats()
+        local chain_stats = runner.make_empty_chain_stats()
         plugin:doProgressSync({
             trigger = trigger,
             silent_mode = true,
@@ -120,8 +121,8 @@ local function dispatch_auto_chain(opts)
                     silent_mode = true,
                     chain_stats = chain_stats,
                     on_done = function()
-                        if plugin:chain_total_failed(chain_stats) > 0 then
-                            plugin:showChainSummary(chain_stats)
+                        if runner.chain_total_failed(chain_stats) > 0 then
+                            runner.show_chain_summary(chain_stats)
                         end
                     end,
                 })

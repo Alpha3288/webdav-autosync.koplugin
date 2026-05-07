@@ -8,16 +8,15 @@ and auto-download or manually pull all files.
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local ConfirmBox = require("ui/widget/confirmbox")
-local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
 local TextViewer = require("ui/widget/textviewer")
 local SpinWidget = require("ui/widget/spinwidget")
 local UIManager = require("ui/uimanager")
-local Event = require("ui/event")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local logger = require("logger")
 local settings = require("settings")
 local triggers = require("triggers")
+local runner = require("runner")
 local sync = require("sync")
 local webdav = require("webdav")
 local T = require("ffi/util").template
@@ -33,101 +32,6 @@ local WebDAVSync = WidgetContainer:extend{
     -- broadcasts collapse into a single sync.
     is_doc_only = false,
 }
-
--- Stats accumulator for the chain (progress sync → book auto-sync) used
--- on Resume and on the startup hook in init(). When `chain_stats` is set
--- on a runner call, the runner stores its counts in the matching section
--- (`progress` or `books`) and the per-run summary popup is suppressed;
--- the orchestrator shows ONE merged summary at chain end via
--- `showChainSummary`, with each sync on its own line so the user can
--- tell which counts came from which sync.
---
--- A nil section means the runner never reported (e.g., reader-context
--- skip for book auto-sync, in-flight skip, offline). Plan-level failures
--- still set a section — `mergeChainStats` is called with a synthetic
--- stats table so the merged summary surfaces the failure.
---
--- `downloaded_rels` is union'd across both sections — the post-chain
--- library-refresh broadcast doesn't care which sync produced which file.
-local function make_empty_chain_stats()
-    return {
-        progress = nil,
-        books = nil,
-        downloaded_rels = {},
-    }
-end
-
--- Sum of `failed` across both sections (treating nil section as 0).
--- Used by silent_mode chain orchestrators to decide whether to show
--- the merged summary popup at all — silent_mode only shows on failure.
-local function chain_total_failed(chain_stats)
-    local n = 0
-    if chain_stats.progress then n = n + (chain_stats.progress.failed or 0) end
-    if chain_stats.books then n = n + (chain_stats.books.failed or 0) end
-    return n
-end
-
--- Per-runner stats accumulator initialized from a fresh plan_obj. The
--- plan tells us up front how many entries were classified as
--- skipped_unchanged or baselined; everything else starts at zero and is
--- bumped by run_action_loop / resolveConflictsInteractive. Used by
--- runTwoWaySync, runProgressSync, doProgressSyncForBook (the three
--- "planned" runners). runOneWaySync has its own shape (sync.run_sync
--- returns counts directly).
-local function init_stats_from_plan(plan_obj)
-    return {
-        downloaded = 0,
-        uploaded = 0,
-        unchanged = plan_obj.actions.skipped_unchanged,
-        baselined = plan_obj.actions.baselined,
-        conflicts_skipped = 0,
-        failed = 0,
-        failures = {},
-        downloaded_rels = {},
-    }
-end
-
--- Iterate the planner's to_download and to_upload action arrays,
--- mutating `stats` in place. Per-rel HTTP failures populate
--- stats.failures with "<rel> (<msg>)" strings — same format the
--- conflict resolver uses, so the merged display is consistent.
--- on_action_failure is an optional callback (kind, rel, msg) → ()
--- used by the close-trigger runner to emit logger.warn lines per
--- failure (it has no other UI surface for them).
-local function run_action_loop(plan_obj, stats, on_action_failure)
-    for _, a in ipairs(plan_obj.actions.to_download) do
-        local ok, msg = sync.do_action(plan_obj, "download", a)
-        if ok then
-            stats.downloaded = stats.downloaded + 1
-            table.insert(stats.downloaded_rels, a.rel)
-        else
-            stats.failed = stats.failed + 1
-            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
-            if on_action_failure then on_action_failure("download", a.rel, msg) end
-        end
-    end
-    for _, a in ipairs(plan_obj.actions.to_upload) do
-        local ok, msg = sync.do_action(plan_obj, "upload", a)
-        if ok then
-            stats.uploaded = stats.uploaded + 1
-        else
-            stats.failed = stats.failed + 1
-            table.insert(stats.failures, a.rel .. " (" .. tostring(msg) .. ")")
-            if on_action_failure then on_action_failure("upload", a.rel, msg) end
-        end
-    end
-end
-
--- Temporary bridge methods for triggers.lua (Task 2). triggers.dispatch_auto_chain
--- calls these via the bound plugin instance. They wrap the module-locals above.
--- These three methods move to runner.lua in Task 3 and are deleted here.
-function WebDAVSync:make_empty_chain_stats()
-    return make_empty_chain_stats()
-end
-
-function WebDAVSync:chain_total_failed(chain_stats)
-    return chain_total_failed(chain_stats)
-end
 
 function WebDAVSync:init()
     Dispatcher:registerAction("webdav_sync_now", {
@@ -661,9 +565,6 @@ function WebDAVSync:doSync(opts)
     opts = opts or {}
     local is_auto = opts.is_auto
     local turn_off_wifi = opts.turn_off_wifi
-    -- silent_mode: auto-trigger UI (no syncing message, no summary on
-    -- success). Default false (manual UI: full popups). All auto callers
-    -- (startup, resume, close) pass true.
     local silent_mode = opts.silent_mode == true
     local chain_stats = opts.chain_stats
     local on_done = opts.on_done
@@ -675,8 +576,6 @@ function WebDAVSync:doSync(opts)
 
     local NetworkMgr = require("ui/network/manager")
     if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
-        -- Auto triggers (startup, Resume) silently no-op when offline; only
-        -- manual entry points pop the Wi-Fi prompt.
         if is_auto then
             logger.dbg("webdav_autosync: book sync skip reason=offline (auto)")
             if on_done then on_done() end
@@ -702,25 +601,21 @@ function WebDAVSync:doSync(opts)
     end
     local username = settings.get("username", "")
     local password = settings.get("password", "")
-    local folder = settings.get("download_folder", "")
+    local local_folder = settings.get("download_folder", "")
     local file_extensions = settings.get("file_extensions", "")
-    if not folder or folder == "" then
+    if not local_folder or local_folder == "" then
         UIManager:show(ConfirmBox:new{
             text = _("Download folder not set. Choose folder now?"),
             ok_text = _("Choose folder"),
-            ok_callback = function()
-                self:setDownloadFolder()
-            end,
+            ok_callback = function() self:setDownloadFolder() end,
         })
         return
     end
-    if not server_url or server_url == "" then
+    if server_url == "" then
         UIManager:show(ConfirmBox:new{
             text = _("WebDAV server not set. Set it now?"),
             ok_text = _("WebDAV server"),
-            ok_callback = function()
-                self:setWebDAVServer()
-            end,
+            ok_callback = function() self:setWebDAVServer() end,
         })
         return
     end
@@ -730,7 +625,7 @@ function WebDAVSync:doSync(opts)
         server_url = server_url,
         username = username,
         password = password,
-        folder = folder,
+        local_folder = local_folder,
         file_extensions = file_extensions,
         is_auto = is_auto,
         turn_off_wifi = turn_off_wifi,
@@ -740,387 +635,32 @@ function WebDAVSync:doSync(opts)
     }
     if two_way then
         logger.info("webdav_autosync: book sync start mode=two_way is_auto=" .. tostring(is_auto == true))
-        self:runTwoWaySync(ctx)
+        runner.run_planned(
+            function(c) return sync.plan(c.server_url, c.username, c.password,
+                    c.local_folder, c.file_extensions) end,
+            ctx,
+            {
+                silent_mode = silent_mode,
+                chain_stats = chain_stats,
+                chain_section = "books",
+                syncing_text = _("Syncing…"),
+                summary_prefix = _("Sync done."),
+                plan_failure_label = _("book sync"),
+                plan_failure_prefix = _("Sync failed: %1"),
+                on_done = on_done,
+                log_done = function(stats)
+                    logger.info(string.format(
+                        "webdav_autosync: book sync done mode=two_way downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
+                        stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
+                        stats.conflicts_skipped, stats.failed))
+                end,
+            })
     else
         logger.info("webdav_autosync: book sync start mode=one_way is_auto=" .. tostring(is_auto == true))
-        self:runOneWaySync(ctx)
+        runner.run_one_way(ctx)
     end
 end
 
-function WebDAVSync:runOneWaySync(ctx)
-    triggers.acquire_sync_lock()
-    -- silent_mode = true is the auto-trigger UI: no "Syncing…" InfoMessage
-    -- during the run, no summary popup at the end UNLESS something failed.
-    -- Conflict resolution dialogs and plan-failure popups are unaffected
-    -- (they're always shown — they need user attention).
-    local silent_mode = ctx.silent_mode == true
-    local chain_stats = ctx.chain_stats
-    local syncing_msg
-    if not silent_mode then
-        syncing_msg = InfoMessage:new{ text = _("Syncing…") }
-        UIManager:show(syncing_msg)
-        UIManager:forceRePaint()
-    end
-    local downloaded, skipped, failed, err, downloaded_rels = sync.run_sync(
-            ctx.server_url, ctx.username, ctx.password,
-            ctx.folder, nil, ctx.file_extensions)
-    if syncing_msg then UIManager:close(syncing_msg) end
-    logger.info(string.format(
-        "webdav_autosync: book sync done mode=one_way downloaded=%d skipped=%d failed=%d",
-        downloaded, skipped, failed))
-    if chain_stats then
-        -- Map one-way fields onto the chain stats schema. one-way has no
-        -- upload / baseline / conflict notion (strict download-only) and
-        -- `err` is a single string covering plan/list-level failure
-        -- rather than a per-rel breakdown — fold it as one synthetic
-        -- failures entry. `failed` stays a per-rel HTTP failure count;
-        -- the synthetic entry from `err` adds to that conceptually but
-        -- isn't counted twice (the section line shows `failed` and the
-        -- failures list at the bottom shows the synthetic message).
-        local failures = {}
-        if err then
-            table.insert(failures, _("book sync") .. " (" .. tostring(err) .. ")")
-        end
-        self:mergeChainStats(chain_stats, {
-            downloaded = downloaded,
-            uploaded = 0,
-            unchanged = skipped,
-            baselined = 0,
-            conflicts_skipped = 0,
-            failed = failed,
-            failures = failures,
-            downloaded_rels = downloaded_rels,
-        }, "books")
-    elseif (not silent_mode) or failed > 0 or err then
-        -- Standalone path: show summary always when not silent_mode, or
-        -- only on failure when silent_mode. A run that downloaded 4 and
-        -- failed on 1 still reports "4 downloaded" alongside the failure.
-        local parts = {}
-        table.insert(parts, T(_("Downloaded %1 file(s)."), tostring(downloaded)))
-        if skipped > 0 then
-            table.insert(parts, T(_("%1 skipped (already exists)."), tostring(skipped)))
-        end
-        if failed > 0 then
-            table.insert(parts, T(_("%1 failed."), tostring(failed)))
-        end
-        local text = _("Sync done.") .. " " .. table.concat(parts, " ")
-        if err then text = text .. "\n\n" .. tostring(err) end
-        UIManager:show(InfoMessage:new{ text = text })
-    end
-    -- Files that did get written still trigger a refresh, even when err is set.
-    self:notifyLibraryRefresh(ctx.folder, downloaded_rels)
-    self:turnOffWifiIfRequested(ctx)
-    triggers.release_sync_lock()
-    if ctx.on_done then ctx.on_done() end
-end
-
-function WebDAVSync:runTwoWaySync(ctx)
-    triggers.acquire_sync_lock()
-    -- See runOneWaySync for silent_mode semantics — same here.
-    local silent_mode = ctx.silent_mode == true
-    local chain_stats = ctx.chain_stats
-    local syncing_msg
-    if not silent_mode then
-        syncing_msg = InfoMessage:new{ text = _("Syncing…") }
-        UIManager:show(syncing_msg)
-        UIManager:forceRePaint()
-    end
-
-    local plan_obj, err = sync.plan(ctx.server_url, ctx.username, ctx.password,
-            ctx.folder, ctx.file_extensions)
-    if not plan_obj then
-        if syncing_msg then UIManager:close(syncing_msg) end
-        logger.warn("webdav_autosync: book sync plan failed: " .. tostring(err))
-        if chain_stats then
-            self:mergeChainStats(chain_stats, {
-                downloaded = 0,
-                uploaded = 0,
-                unchanged = 0,
-                baselined = 0,
-                conflicts_skipped = 0,
-                failed = 1,
-                failures = { _("book sync") .. " (" .. tostring(err) .. ")" },
-            }, "books")
-        else
-            -- Plan failure is *always* surfaced (even in silent_mode):
-            -- the user needs to know the sync didn't even start.
-            UIManager:show(InfoMessage:new{
-                text = T(_("Sync failed: %1"), tostring(err)),
-            })
-        end
-        self:turnOffWifiIfRequested(ctx)
-        triggers.release_sync_lock()
-        if ctx.on_done then ctx.on_done() end
-        return
-    end
-
-    local stats = init_stats_from_plan(plan_obj)
-
-    run_action_loop(plan_obj, stats)
-
-    if syncing_msg then UIManager:close(syncing_msg) end
-
-    local conflicts = plan_obj.actions.conflicts
-    local function finish()
-        sync.save_cache(plan_obj)
-        self:notifyLibraryRefresh(plan_obj.local_folder, stats.downloaded_rels)
-        logger.info(string.format(
-            "webdav_autosync: book sync done mode=two_way downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
-            stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
-            stats.conflicts_skipped, stats.failed))
-        if chain_stats then
-            self:mergeChainStats(chain_stats, stats, "books")
-        elseif (not silent_mode) or stats.failed > 0 then
-            self:showSummary(_("Sync done."), stats)
-        end
-        self:turnOffWifiIfRequested(ctx)
-        triggers.release_sync_lock()
-        if ctx.on_done then ctx.on_done() end
-    end
-
-    if #conflicts == 0 then
-        finish()
-        return
-    end
-
-    logger.info("webdav_autosync: book sync surfacing conflicts count=" .. tostring(#conflicts))
-    self:resolveConflictsInteractive(plan_obj, conflicts, stats, finish)
-end
-
-function WebDAVSync:resolveConflictsInteractive(plan_obj, conflicts, stats, on_done)
-    local idx = 1
-    local function next_one()
-        if idx > #conflicts then
-            on_done()
-            return
-        end
-        local c = conflicts[idx]
-        local dialog
-        local function pick(action)
-            UIManager:close(dialog)
-            idx = idx + 1
-            logger.dbg("webdav_autosync: conflict resolution rel=" .. c.rel .. " choice=" .. action)
-            if action == "skip" then
-                stats.conflicts_skipped = stats.conflicts_skipped + 1
-                next_one()
-                return
-            end
-            local ok, msg = sync.do_action(plan_obj, action, c)
-            if ok then
-                if action == "download" then
-                    stats.downloaded = stats.downloaded + 1
-                    if stats.downloaded_rels then
-                        table.insert(stats.downloaded_rels, c.rel)
-                    end
-                else
-                    stats.uploaded = stats.uploaded + 1
-                end
-            else
-                stats.failed = stats.failed + 1
-                table.insert(stats.failures, c.rel .. " (" .. tostring(msg) .. ")")
-            end
-            next_one()
-        end
-        dialog = ButtonDialogTitle:new{
-            title = T(_("Conflict on %1\nBoth local and remote changed since last sync."), c.rel),
-            buttons = {
-                {{ text = _("Keep local (upload)"),     callback = function() pick("upload")   end }},
-                {{ text = _("Keep remote (download)"),  callback = function() pick("download") end }},
-                {{ text = _("Skip"),                    callback = function() pick("skip")     end }},
-            },
-        }
-        UIManager:show(dialog)
-    end
-    next_one()
-end
-
---- Tell KOReader's file-browser / history / collections views to redraw after
---- we replaced sidecar contents (or downloaded a new/changed book file) on
---- disk. Without this the file manager keeps showing stale state — e.g. the
---- old percent-finished / "reading" badge from before a progress sync pulled
---- in newer reading state from another device.
----
---- Two events, in order:
----   1. `InvalidateMetadataCache` per affected book — drops the SQLite-cached
----      metadata row used by `coverbrowser.koplugin` so cover mosaic / list
----      modes re-extract on next render.
----   2. `BookMetadataChanged` (no arg) — handled by `FileManager` (re-walks the
----      current dir and re-reads sidecars), `FileManagerHistory`, `Collection`,
----      and `FileSearcher`. Reader-side handlers (`ReaderCoptListener`,
----      `ReaderFooter`) gate on `prop_updated`, so passing nil makes them no-op
----      — safe to broadcast even with a book open.
----
---- `downloaded_rels` mixes sidecar relpaths (`Books/Foo.sdr/metadata.epub.lua`)
---- and book-file relpaths (`Books/Foo.epub`). Sidecar paths get mapped back to
---- their book file via `<stem>.<ext>`; book paths are used as-is. Sidecar
---- entries other than `metadata.<ext>.lua` (cover, custom_metadata) don't
---- carry the book extension on their own — they fall through to just the
---- global `BookMetadataChanged` and let the file manager re-walk.
-function WebDAVSync:notifyLibraryRefresh(local_folder, downloaded_rels)
-    if not downloaded_rels or #downloaded_rels == 0 then return end
-    if type(local_folder) ~= "string" or local_folder == "" then return end
-    local trimmed = local_folder:gsub("/+$", "")
-
-    local seen = {}
-    for _, rel in ipairs(downloaded_rels) do
-        local book_path
-        local stem, ext = rel:match("^(.+)%.sdr/metadata%.([^.]+)%.lua$")
-        if stem and ext then
-            book_path = trimmed .. "/" .. stem .. "." .. ext
-        elseif not rel:match("%.sdr/") then
-            book_path = trimmed .. "/" .. rel
-        end
-        if book_path and not seen[book_path] then
-            seen[book_path] = true
-            UIManager:broadcastEvent(Event:new("InvalidateMetadataCache", book_path))
-        end
-    end
-
-    local n = 0
-    for _ in pairs(seen) do n = n + 1 end
-    logger.dbg(string.format("webdav_autosync: notifyLibraryRefresh affected_books=%d total_rels=%d",
-            n, #downloaded_rels))
-    UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
-end
-
---- Store a per-runner stats table into chain_stats under `section`
---- ("progress" or "books"). Replaces (not adds) — each runner reports
---- its section once. Downloaded rels are union'd across sections for
---- the eventual single library-refresh broadcast.
----
---- Stats shape from progress / two-way book runners is identical; the
---- one-way book runner maps its differently-shaped result into a
---- synthetic stats table at the call site (skipped → unchanged, single
---- err string → one synthetic failures entry).
-function WebDAVSync:mergeChainStats(chain_stats, stats, section)
-    chain_stats[section] = {
-        downloaded = stats.downloaded,
-        uploaded = stats.uploaded or 0,
-        unchanged = stats.unchanged or 0,
-        baselined = stats.baselined or 0,
-        conflicts_skipped = stats.conflicts_skipped or 0,
-        failed = stats.failed,
-        failures = stats.failures or {},
-    }
-    if stats.downloaded_rels then
-        for _, r in ipairs(stats.downloaded_rels) do
-            table.insert(chain_stats.downloaded_rels, r)
-        end
-    end
-end
-
---- Build one ", "-joined description line for a chain section. Always
---- includes downloaded + uploaded; other counts only when non-zero so a
---- typical no-op run reads "0 downloaded, 0 uploaded" (the user wanted
---- explicit reassurance the sync ran).
-local function describe_chain_section(section)
-    local parts = {}
-    table.insert(parts, T(_("%1 downloaded"), tostring(section.downloaded)))
-    table.insert(parts, T(_("%1 uploaded"), tostring(section.uploaded)))
-    if section.unchanged > 0 then
-        table.insert(parts, T(_("%1 unchanged"), tostring(section.unchanged)))
-    end
-    if section.baselined > 0 then
-        table.insert(parts, T(_("%1 baselined"), tostring(section.baselined)))
-    end
-    if section.conflicts_skipped > 0 then
-        table.insert(parts, T(_("%1 conflicts skipped"), tostring(section.conflicts_skipped)))
-    end
-    if section.failed > 0 then
-        table.insert(parts, T(_("%1 failed"), tostring(section.failed)))
-    end
-    return table.concat(parts, ", ")
-end
-
---- Merged summary popup for the Resume / startup chain. Each sync gets
---- its own line so the user can see which counts belong to which; any
---- per-rel failure messages from either section are listed once at the
---- bottom under a "Failures:" heading. Sections that didn't run (nil)
---- are omitted.
-function WebDAVSync:showChainSummary(stats)
-    local lines = { _("Sync done.") }
-
-    local has_section = false
-    if stats.progress then
-        has_section = true
-        table.insert(lines, "")
-        table.insert(lines, _("Reading progress sync:") .. " " .. describe_chain_section(stats.progress) .. ".")
-    end
-    if stats.books then
-        if not has_section then table.insert(lines, "") end
-        has_section = true
-        table.insert(lines, _("Book sync:") .. " " .. describe_chain_section(stats.books) .. ".")
-    end
-
-    local failures = {}
-    if stats.progress and stats.progress.failures then
-        for _, f in ipairs(stats.progress.failures) do
-            table.insert(failures, f)
-        end
-    end
-    if stats.books and stats.books.failures then
-        for _, f in ipairs(stats.books.failures) do
-            table.insert(failures, f)
-        end
-    end
-    if #failures > 0 then
-        table.insert(lines, "")
-        table.insert(lines, _("Failures:"))
-        for _, f in ipairs(failures) do
-            table.insert(lines, "  " .. f)
-        end
-    end
-
-    UIManager:show(InfoMessage:new{ text = table.concat(lines, "\n") })
-end
-
-function WebDAVSync:showSummary(prefix, stats)
-    local parts = {}
-    table.insert(parts, T(_("%1 downloaded."), tostring(stats.downloaded)))
-    table.insert(parts, T(_("%1 uploaded."), tostring(stats.uploaded)))
-    if stats.unchanged > 0 then
-        table.insert(parts, T(_("%1 unchanged."), tostring(stats.unchanged)))
-    end
-    if stats.baselined > 0 then
-        table.insert(parts, T(_("%1 baselined."), tostring(stats.baselined)))
-    end
-    if stats.conflicts_skipped > 0 then
-        table.insert(parts, T(_("%1 conflicts skipped."), tostring(stats.conflicts_skipped)))
-    end
-    if stats.failed > 0 then
-        table.insert(parts, T(_("%1 failed."), tostring(stats.failed)))
-    end
-    local text = prefix .. " " .. table.concat(parts, " ")
-    if stats.failed > 0 and #stats.failures > 0 then
-        text = text .. "\n\n" .. table.concat(stats.failures, "\n")
-    end
-    UIManager:show(InfoMessage:new{ text = text })
-end
-
-function WebDAVSync:turnOffWifiIfRequested(ctx)
-    if not ctx.turn_off_wifi then return end
-    local NetworkMgr = require("ui/network/manager")
-    if NetworkMgr.turnOffWifi then
-        NetworkMgr:turnOffWifi()
-    end
-end
-
---- Interactive book auto-sync trigger. Called from init() (startup) and as
---- the on_done callback chained from onResume's progress sync; both contexts
---- have the user present, so conflicts surface as dialogs via the existing
---- runTwoWaySync path. No `interactive` parameter is needed — runTwoWaySync
---- always pops the conflict dialog chain (the `is_auto` silent-skip branch
---- was removed when the chain was wired up). The unified auto-trigger
---- cooldown and per-event toggles are enforced by the event handler before
---- this is called, so we don't re-check them here. File-manager-only — a
---- full library scan inside a reader context would be disruptive.
---- opts.silent_mode:          forwarded to doSync; auto-trigger UI when
----                            true (no syncing message, no success summary).
---- opts.chain_stats:          when set, doSync's runner accumulates into it
----                            instead of showing its own summary.
---- opts.on_done:              called on every exit path (no-op skip, sync
----                            done) so the chain orchestrator can show its
----                            merged summary regardless of which branch fires.
 function WebDAVSync:maybeRunBookAutoSync(opts)
     opts = opts or {}
     local function done() if opts.on_done then opts.on_done() end end
@@ -1128,13 +668,11 @@ function WebDAVSync:maybeRunBookAutoSync(opts)
         logger.dbg("webdav_autosync: book auto-sync skip reason=reader-context")
         return done()
     end
-
     local NetworkMgr = require("ui/network/manager")
     if NetworkMgr.isOnline and not NetworkMgr:isOnline() then
         logger.dbg("webdav_autosync: book auto-sync skip reason=offline")
         return done()
     end
-
     self:doSync({
         is_auto = true,
         silent_mode = opts.silent_mode,
@@ -1143,18 +681,6 @@ function WebDAVSync:maybeRunBookAutoSync(opts)
     })
 end
 
---- Full-library progress (`.sdr` sidecar) sync. Always interactive in the
---- UI sense: shows a syncing message, surfaces failures, runs the conflict
---- dialog chain, and shows a summary. The silent close trigger goes through
---- doProgressSyncForBook instead.
---- opts.manual = true:        manual entry (menu / Dispatcher action). Prompts
----                            to enable Wi-Fi if needed; auto triggers
----                            (init, Resume) silently no-op when offline.
---- opts.on_done:              optional callback invoked once the runner is done
----                            with this trigger (every exit path: gated, no-op,
----                            completed, conflicts resolved). Used by onResume
----                            to chain progress sync → book auto-sync without
----                            their dialog chains overlapping in the UI stack.
 function WebDAVSync:doProgressSync(opts)
     opts = opts or {}
     local manual = opts.manual == true
@@ -1165,12 +691,6 @@ function WebDAVSync:doProgressSync(opts)
 
     if triggers.check_in_flight("progress sync", manual) then return done() end
 
-    -- The per-event toggle gating happens in the event handlers (init,
-    -- onResume) before they call us; manual entry points bypass the toggles
-    -- entirely. So no toggle check here.
-
-    -- Cheap config check first: skip remaining work entirely (incl. the
-    -- network probe below) on installs that aren't configured yet.
     local server_url = settings.get("server_url", "")
     local local_folder = settings.get("download_folder", "")
     if type(server_url) ~= "string" then server_url = "" end
@@ -1186,9 +706,6 @@ function WebDAVSync:doProgressSync(opts)
         return done()
     end
 
-    -- Sidecars must live next to books for the relpath mapping to work; in
-    -- the `dir` and `hash` modes they're outside the synced library tree.
-    -- Lua precedence here: `(G_reader_settings and readSetting(...)) or "doc"`.
     local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
     if meta_mode ~= "doc" then
         logger.dbg("webdav_autosync: progress sync skip reason=metadata-folder-mode mode=" .. tostring(meta_mode))
@@ -1200,24 +717,44 @@ function WebDAVSync:doProgressSync(opts)
         return done()
     end
 
-    -- The unified auto-trigger cooldown is enforced by the event handlers
-    -- (onResume, onCloseDocument, init startup) before they call us. A
-    -- chained on_done call also lands here without re-checking, by design.
-    -- Manual entry points bumped the cooldown timestamp at their own start.
     local NetworkMgr = require("ui/network/manager")
+    local function dispatch()
+        local username = settings.get("username", "")
+        local password = settings.get("password", "")
+        logger.info("webdav_autosync: progress sync start")
+        local ctx = {
+            server_url = server_url,
+            username = username,
+            password = password,
+            local_folder = local_folder,
+        }
+        runner.run_planned(
+            function(c) return sync.plan_progress(c.server_url, c.username, c.password, c.local_folder) end,
+            ctx,
+            {
+                silent_mode = silent_mode,
+                chain_stats = chain_stats,
+                chain_section = "progress",
+                syncing_text = _("Syncing reading progress…"),
+                summary_prefix = _("Reading progress synced."),
+                plan_failure_label = _("progress sync"),
+                plan_failure_prefix = _("Progress sync failed: %1"),
+                on_done = on_done,
+                log_done = function(stats)
+                    logger.info(string.format(
+                        "webdav_autosync: progress sync done downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
+                        stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
+                        stats.conflicts_skipped, stats.failed))
+                end,
+            })
+    end
+
     if not manual then
         if NetworkMgr.isOnline and not NetworkMgr:isOnline() then
             logger.dbg("webdav_autosync: progress sync skip reason=offline (auto)")
             return done()
         end
-        self:runProgressSync({
-            server_url = server_url,
-            local_folder = local_folder,
-            on_done = on_done,
-            silent_mode = silent_mode,
-            chain_stats = chain_stats,
-        })
-        return
+        return dispatch()
     end
 
     if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
@@ -1234,33 +771,10 @@ function WebDAVSync:doProgressSync(opts)
         return
     end
 
-    self:runProgressSync({
-        server_url = server_url,
-        local_folder = local_folder,
-        on_done = on_done,
-        silent_mode = silent_mode,
-        chain_stats = chain_stats,
-    })
+    dispatch()
 end
 
---- Scoped progress sync for one just-closed book. Called from
---- onCloseDocument after the per-book debounce passes. One PROPFIND on
---- `<book>.sdr/`, executes non-conflicting actions, runs the conflict
---- dialog chain if needed, and surfaces a summary popup ONLY on failure.
---- Same gates as doProgressSync: the toggle, the `doc` metadata-folder
---- requirement, server/folder configured, online.
----
---- Auto-trigger UI policy (silent_mode): silent on success, popup only
---- on failure. Conflicts now surface immediately via the same dialog
---- chain as the interactive triggers — they're no longer deferred.
---- Pre-1.8.0 the close trigger swallowed conflicts and left them for
---- the next Resume/startup; the user asked for them to be surfaced now
---- so the change is visible at the moment they happen (the user just
---- closed the book; a dialog right after is cheap).
 function WebDAVSync:doProgressSyncForBook(book_rel)
-    -- Gating (master + progress_on_close) is enforced by onCloseDocument
-    -- before this runs; we don't re-check here.
-
     if triggers.check_in_flight("close-trigger sync", false) then return end
 
     local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
@@ -1285,147 +799,38 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
         return
     end
 
-    -- Past the cheap config gates: from here on we'll touch the cache and the
-    -- network, so claim the in-flight lock. Released on every exit below.
-    triggers.acquire_sync_lock()
-
     local username = settings.get("username", "")
     local password = settings.get("password", "")
     logger.info("webdav_autosync: close-trigger sync start book=" .. tostring(book_rel))
-    local plan_obj, err = sync.plan_progress_book(server_url, username, password, local_folder, book_rel)
-    if not plan_obj then
-        logger.warn("webdav_autosync: close-trigger plan failed book=" .. tostring(book_rel) .. " err=" .. tostring(err))
-        -- Plan failure is *always* surfaced — the user needs to know the
-        -- close-trigger sync didn't run. Same policy as the other runners.
-        UIManager:show(InfoMessage:new{
-            text = T(_("Progress sync failed: %1"), tostring(err)),
+
+    local ctx = {
+        server_url = server_url,
+        username = username,
+        password = password,
+        local_folder = local_folder,
+        book_rel = book_rel,
+    }
+    runner.run_planned(
+        function(c) return sync.plan_progress_book(c.server_url, c.username, c.password,
+                c.local_folder, c.book_rel) end,
+        ctx,
+        {
+            silent_mode = true,
+            syncing_text = _("Syncing reading progress…"),
+            summary_prefix = _("Reading progress synced."),
+            plan_failure_label = _("progress sync"),
+            plan_failure_prefix = _("Progress sync failed: %1"),
+            on_action_failure = function(kind, rel, msg)
+                logger.warn("webdav_autosync: close-trigger " .. kind .. " failed rel=" .. rel .. " err=" .. tostring(msg))
+            end,
+            log_done = function(stats)
+                logger.info(string.format(
+                    "webdav_autosync: close-trigger sync done book=%s downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
+                    tostring(book_rel), stats.downloaded, stats.uploaded,
+                    stats.unchanged, stats.baselined,
+                    stats.conflicts_skipped, stats.failed))
+            end,
         })
-        triggers.release_sync_lock()
-        return
-    end
-
-    local stats = init_stats_from_plan(plan_obj)
-
-    run_action_loop(plan_obj, stats, function(kind, rel, msg)
-        logger.warn("webdav_autosync: close-trigger " .. kind .. " failed rel=" .. rel .. " err=" .. tostring(msg))
-    end)
-
-    local conflicts = plan_obj.actions.conflicts
-    local function finish()
-        sync.save_cache(plan_obj)
-        self:notifyLibraryRefresh(plan_obj.local_folder, stats.downloaded_rels)
-        logger.info(string.format(
-            "webdav_autosync: close-trigger sync done book=%s downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
-            tostring(book_rel), stats.downloaded, stats.uploaded,
-            stats.unchanged, stats.baselined,
-            stats.conflicts_skipped, stats.failed))
-        -- silent_mode policy: summary popup only when something failed.
-        if stats.failed > 0 then
-            self:showSummary(_("Reading progress synced."), stats)
-        end
-        triggers.release_sync_lock()
-    end
-
-    if #conflicts == 0 then
-        finish()
-        return
-    end
-
-    logger.info("webdav_autosync: close-trigger sync surfacing conflicts count=" .. tostring(#conflicts))
-    self:resolveConflictsInteractive(plan_obj, conflicts, stats, finish)
-end
-
---- Run a full-library progress sync. Surfaces plan errors, runs the
---- conflict dialog chain, and shows a summary at the end.
---- opts.silent_mode:          auto-trigger UI when true — no "Syncing
----                            reading progress…" InfoMessage during the
----                            run, no summary popup at the end UNLESS
----                            something failed. Default false (manual UI).
---- opts.chain_stats:          optional accumulator. When set, this run's
----                            counts are stored in it (under "progress")
----                            and the per-run summary popup is suppressed;
----                            the chain orchestrator shows ONE merged
----                            summary at chain end. Plan failure folds in
----                            as one synthetic failure entry.
---- Silent close-trigger syncs go through doProgressSyncForBook instead.
-function WebDAVSync:runProgressSync(opts)
-    local server_url = opts.server_url
-    local local_folder = opts.local_folder
-    local on_done = opts.on_done
-    local silent_mode = opts.silent_mode == true
-    local chain_stats = opts.chain_stats
-    local function done() if on_done then on_done() end end
-
-    triggers.acquire_sync_lock()
-    local username = settings.get("username", "")
-    local password = settings.get("password", "")
-
-    local syncing_msg
-    if not silent_mode then
-        syncing_msg = InfoMessage:new{ text = _("Syncing reading progress…") }
-        UIManager:show(syncing_msg)
-        UIManager:forceRePaint()
-    end
-
-    logger.info("webdav_autosync: progress sync start")
-    local plan_obj, err = sync.plan_progress(server_url, username, password, local_folder)
-    if not plan_obj then
-        if syncing_msg then UIManager:close(syncing_msg) end
-        logger.warn("webdav_autosync: progress plan failed: " .. tostring(err))
-        if chain_stats then
-            self:mergeChainStats(chain_stats, {
-                downloaded = 0,
-                uploaded = 0,
-                unchanged = 0,
-                baselined = 0,
-                conflicts_skipped = 0,
-                failed = 1,
-                failures = { _("progress sync") .. " (" .. tostring(err) .. ")" },
-            }, "progress")
-        else
-            -- Plan failure is *always* surfaced (even in silent_mode):
-            -- the user needs to know the sync didn't even start.
-            UIManager:show(InfoMessage:new{
-                text = T(_("Progress sync failed: %1"), tostring(err)),
-            })
-        end
-        triggers.release_sync_lock()
-        return done()
-    end
-
-    -- resolveConflictsInteractive appends conflict-resolved downloads to
-    -- stats.downloaded_rels when present; we feed the whole list to
-    -- notifyLibraryRefresh.
-    local stats = init_stats_from_plan(plan_obj)
-
-    run_action_loop(plan_obj, stats)
-
-    if syncing_msg then UIManager:close(syncing_msg) end
-
-    local conflicts = plan_obj.actions.conflicts
-    local function finish()
-        sync.save_cache(plan_obj)
-        self:notifyLibraryRefresh(plan_obj.local_folder, stats.downloaded_rels)
-        logger.info(string.format(
-            "webdav_autosync: progress sync done downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
-            stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
-            stats.conflicts_skipped, stats.failed))
-        if chain_stats then
-            self:mergeChainStats(chain_stats, stats, "progress")
-        elseif (not silent_mode) or stats.failed > 0 then
-            self:showSummary(_("Reading progress synced."), stats)
-        end
-        triggers.release_sync_lock()
-        done()
-    end
-
-    if #conflicts == 0 then
-        finish()
-        return
-    end
-
-    logger.info("webdav_autosync: progress sync surfacing conflicts count=" .. tostring(#conflicts))
-    self:resolveConflictsInteractive(plan_obj, conflicts, stats, finish)
 end
 
 function WebDAVSync:showHelp()
