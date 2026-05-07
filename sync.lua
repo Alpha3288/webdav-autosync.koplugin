@@ -92,6 +92,23 @@ local function extension_allowed(path, extensions_set)
     return false
 end
 
+--- Reject relpaths that would escape the sync root or contain a NUL byte.
+--- A hostile or buggy WebDAV server can return hrefs containing `..` segments
+--- after the base prefix is stripped, which would let the planner write
+--- outside the user's download folder. Local-side rejection is symmetric
+--- defense-in-depth: lfs walks under a known root never produce `..`, but
+--- the rule "no rel ever contains `..`" is cleaner as an invariant of the
+--- rel-space than a property of which side produced it.
+local function rel_is_safe(rel)
+    if not rel or rel == "" then return false end
+    if rel:find("\0", 1, true) then return false end
+    if rel:sub(1, 1) == "/" then return false end
+    for segment in rel:gmatch("[^/]+") do
+        if segment == ".." or segment == "." then return false end
+    end
+    return true
+end
+
 --- Get base path from WebDAV URL (path part only, no trailing slash).
 local function base_path_from_url(url)
     url = webdav.normalize_url(url)
@@ -146,7 +163,7 @@ local function walk_local(folder, predicate)
                     local rel = prefix == "" and entry or (prefix .. "/" .. entry)
                     if attr.mode == "directory" then
                         recurse(full, rel)
-                    elseif attr.mode == "file" and predicate(entry, rel) then
+                    elseif attr.mode == "file" and rel_is_safe(rel) and predicate(entry, rel) then
                         out[rel] = {
                             path = full,
                             mtime = attr.modification,
@@ -338,8 +355,13 @@ local function run_sync(server_url, username, password, local_folder, progress_c
     local extensions_set = parse_extensions(extensions_filter)
     local files = {}
     for _, e in ipairs(list) do
-        if not e.is_collection and extension_allowed(e.path or "", extensions_set) then
-            table.insert(files, e)
+        if not e.is_collection then
+            local rel = rel_from_remote_path(e.path or "", base)
+            if rel_is_safe(rel) and extension_allowed(e.path or "", extensions_set) then
+                table.insert(files, e)
+            elseif not rel_is_safe(rel) then
+                logger.dbg("webdav_autosync: run_sync drop unsafe remote rel=" .. rel)
+            end
         end
     end
     local count_ok = 0
@@ -499,16 +521,20 @@ local function build_remote_index(list, server_url, keep)
     for _, e in ipairs(list) do
         if not e.is_collection then
             local rel = rel_from_remote_path(e.path or "", base)
-            if rel ~= "" and keep(rel, e) then
-                local href_full = e.href_full or e.href
-                if not href_full:match("^https?://") then
-                    href_full = origin .. (href_full:gsub("^/+", "/"))
+            if rel ~= "" then
+                if not rel_is_safe(rel) then
+                    logger.dbg("webdav_autosync: drop unsafe remote rel=" .. rel)
+                elseif keep(rel, e) then
+                    local href_full = e.href_full or e.href
+                    if not href_full:match("^https?://") then
+                        href_full = origin .. (href_full:gsub("^/+", "/"))
+                    end
+                    index[rel] = {
+                        href = href_full,
+                        etag = e.etag,
+                        mtime = e.mtime,
+                    }
                 end
-                index[rel] = {
-                    href = href_full,
-                    etag = e.etag,
-                    mtime = e.mtime,
-                }
             end
         end
     end
