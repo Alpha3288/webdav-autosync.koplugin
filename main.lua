@@ -50,6 +50,31 @@ function WebDAVSync:init()
     triggers.schedule_startup_sync()
 end
 
+local function event_toggle_row(text, event_key, help_text, separator)
+    return {
+        text = text,
+        enabled_func = function() return settings.is_master_on() end,
+        checked_func = function()
+            return G_reader_settings:isTrue("webdav_autosync_" .. event_key)
+        end,
+        callback = function()
+            G_reader_settings:flipNilOrFalse("webdav_autosync_" .. event_key)
+        end,
+        help_text = help_text,
+        separator = separator,
+    }
+end
+
+local function spin_setting_row(text_func, callback_fn, help_text)
+    return {
+        text_func = text_func,
+        enabled_func = function() return settings.is_master_on() end,
+        keep_menu_open = true,
+        callback = callback_fn,
+        help_text = help_text,
+    }
+end
+
 function WebDAVSync:addToMainMenu(menu_items)
     menu_items.webdav_sync = {
         text = _("WebDAV Sync"),
@@ -113,116 +138,34 @@ function WebDAVSync:addToMainMenu(menu_items)
                         help_text = _("Master switch for every automatic trigger below. Off: nothing fires automatically (manual sync still works). On: each individual trigger toggle takes effect."),
                         separator = true,
                     },
-                    {
-                        text = _("Sync books on startup"),
-                        enabled_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_master")
-                        end,
-                        checked_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_books_on_startup")
-                        end,
-                        callback = function()
-                            G_reader_settings:flipNilOrFalse("webdav_autosync_books_on_startup")
-                        end,
-                        help_text = _("Run book sync once when KOReader starts. File-manager context only."),
-                    },
-                    {
-                        text = _("Sync books on wake"),
-                        enabled_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_master")
-                        end,
-                        checked_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_books_on_resume")
-                        end,
-                        callback = function()
-                            G_reader_settings:flipNilOrFalse("webdav_autosync_books_on_resume")
-                        end,
-                        help_text = _("Run book sync after the device wakes from sleep. File-manager context only."),
-                        separator = true,
-                    },
-                    {
-                        text = _("Sync reading progress on startup"),
-                        enabled_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_master")
-                        end,
-                        checked_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_progress_on_startup")
-                        end,
-                        callback = function()
-                            G_reader_settings:flipNilOrFalse("webdav_autosync_progress_on_startup")
-                        end,
-                        help_text = _("Reconcile every .sdr sidecar (reading position, bookmarks, highlights) once when KOReader starts. Conflicts pop a per-file dialog."),
-                    },
-                    {
-                        text = _("Sync reading progress on wake"),
-                        enabled_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_master")
-                        end,
-                        checked_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_progress_on_resume")
-                        end,
-                        callback = function()
-                            G_reader_settings:flipNilOrFalse("webdav_autosync_progress_on_resume")
-                        end,
-                        help_text = _("Reconcile every .sdr sidecar after the device wakes from sleep. Conflicts pop a per-file dialog."),
-                    },
-                    {
-                        text = _("Sync reading progress on book close"),
-                        enabled_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_master")
-                        end,
-                        checked_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_progress_on_close")
-                        end,
-                        callback = function()
-                            G_reader_settings:flipNilOrFalse("webdav_autosync_progress_on_close")
-                        end,
-                        help_text = _("Push the just-closed book's .sdr sidecar (one network request, scoped to that book). Silent — conflicts surface immediately via the per-file dialog."),
-                        separator = true,
-                    },
-                    {
-                        text_func = function()
-                            return T(_("Auto sync cooldown: %1 s"), tostring(settings.get_cooldown()))
-                        end,
-                        enabled_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_master")
-                        end,
-                        keep_menu_open = true,
-                        callback = function()
-                            ui.set_cooldown()
-                        end,
-                        help_text = _("Minimum seconds between auto-triggered full reconciles (device wake, KOReader startup). Manual syncs always run regardless. The book-close trigger has its own cooldown below. 0 disables. Default 300 s."),
-                    },
-                    {
-                        text_func = function()
-                            return T(_("Close-trigger sync cooldown: %1 s"), tostring(settings.get_close_cooldown()))
-                        end,
-                        enabled_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_master")
-                        end,
-                        keep_menu_open = true,
-                        callback = function()
-                            ui.set_close_cooldown()
-                        end,
-                        help_text = _("Minimum seconds between two consecutive close-trigger syncs of the same book. Closing a different book always runs regardless (each book's .sdr/ is independent). 0 disables. Default 30 s."),
-                    },
-                    {
-                        text_func = function()
+                    event_toggle_row(_("Sync books on startup"), "books_on_startup",
+                        _("Run book sync once when KOReader starts. File-manager context only.")),
+                    event_toggle_row(_("Sync books on wake"), "books_on_resume",
+                        _("Run book sync after the device wakes from sleep. File-manager context only."),
+                        true),
+                    event_toggle_row(_("Sync reading progress on startup"), "progress_on_startup",
+                        _("Reconcile every .sdr sidecar (reading position, bookmarks, highlights) once when KOReader starts. Conflicts pop a per-file dialog.")),
+                    event_toggle_row(_("Sync reading progress on wake"), "progress_on_resume",
+                        _("Reconcile every .sdr sidecar after the device wakes from sleep. Conflicts pop a per-file dialog.")),
+                    event_toggle_row(_("Sync reading progress on book close"), "progress_on_close",
+                        _("Push the just-closed book's .sdr sidecar (one network request, scoped to that book). Silent — conflicts surface immediately via the per-file dialog."),
+                        true),
+                    spin_setting_row(
+                        function() return T(_("Auto sync cooldown: %1 s"), tostring(settings.get_cooldown())) end,
+                        function() ui.set_cooldown() end,
+                        _("Minimum seconds between auto-triggered full reconciles (device wake, KOReader startup). Manual syncs always run regardless. The book-close trigger has its own cooldown below. 0 disables. Default 300 s.")),
+                    spin_setting_row(
+                        function() return T(_("Close-trigger sync cooldown: %1 s"), tostring(settings.get_close_cooldown())) end,
+                        function() ui.set_close_cooldown() end,
+                        _("Minimum seconds between two consecutive close-trigger syncs of the same book. Closing a different book always runs regardless (each book's .sdr/ is independent). 0 disables. Default 30 s.")),
+                    spin_setting_row(
+                        function()
                             local secs = settings.get_resume_settle()
-                            if secs <= 0 then
-                                return _("Wake settle delay: 0 s (disabled)")
-                            end
+                            if secs <= 0 then return _("Wake settle delay: 0 s (disabled)") end
                             return T(_("Wake settle delay: %1 s"), tostring(secs))
                         end,
-                        enabled_func = function()
-                            return G_reader_settings:isTrue("webdav_autosync_master")
-                        end,
-                        keep_menu_open = true,
-                        callback = function()
-                            ui.set_resume_settle()
-                        end,
-                        help_text = _("How long to wait after the device wakes before starting an auto-sync. Filters brief system wakes (RTC alarms, hall-sensor twitches, framework background tasks) so they don't burn the cooldown. 0 disables the gate (sync runs immediately on wake — pre-1.7.8 behavior). Default 15 s."),
-                    },
+                        function() ui.set_resume_settle() end,
+                        _("How long to wait after the device wakes before starting an auto-sync. Filters brief system wakes (RTC alarms, hall-sensor twitches, framework background tasks) so they don't burn the cooldown. 0 disables the gate (sync runs immediately on wake — pre-1.7.8 behavior). Default 15 s.")),
                 },
             },
             {
