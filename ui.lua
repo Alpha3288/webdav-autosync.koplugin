@@ -54,6 +54,13 @@ local function set_webdav_server(_plugin)
                         local u = (fields and fields[2]) and tostring(fields[2]) or ""
                         local p = (fields and fields[3]) and tostring(fields[3]) or ""
                         a = a:gsub("^%s+", ""):gsub("%s+$", "")
+                        -- Reject typo'd URLs at save time so subsequent syncs
+                        -- don't fail with a cryptic "Server URL has no host"
+                        -- popup. Empty leaves the existing URL untouched (user
+                        -- editing only credentials). Non-empty must parse to
+                        -- something with a host — webdav.url_has_host runs the
+                        -- same normalize_url(...) the sync paths use, so what
+                        -- passes here is what they accept.
                         if a ~= "" and not webdav.url_has_host(a) then
                             UIManager:show(InfoMessage:new{
                                 text = _("Server URL must include a host (e.g. https://example.com/webdav)."),
@@ -324,7 +331,7 @@ end
 return {
     set_webdav_server = set_webdav_server,
     import_from_cloud_storage = import_from_cloud_storage,
-    apply_cloud_storage_entry = apply_cloud_storage_entry,
+
     set_download_folder = set_download_folder,
     set_cooldown = set_cooldown,
     set_close_cooldown = set_close_cooldown,
