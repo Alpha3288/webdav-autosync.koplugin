@@ -5,7 +5,6 @@ Matches KOReader's apps/cloudstorage/webdavapi.lua: socket.http, user/password i
 --]]--
 
 local ltn12 = require("ltn12")
-local socket = require("socket")
 local http = require("socket.http")
 local logger = require("logger")
 local util = require("util")
@@ -145,6 +144,35 @@ local function parse_propfind_response(body)
     return list
 end
 
+--- Send one HTTP request, threading socketutil's timeout pair around it
+--- and emitting one dbg line on the way out. Caller passes a fully-formed
+--- `request` table (already has url + method + headers + sink/source +
+--- user/password) and a label for the log line. `timeout_pair` is either
+--- nil (use socketutil's default) or `{block, total}` for the file-transfer
+--- methods.
+---
+--- Returns the same triple the original socket.skip(1, http.request(req))
+--- call produced: code, headers, status. The status string is what
+--- socket.http puts after the status code; on transport-level failure the
+--- code is a string (e.g. "timeout", "closed") and headers/status are nil.
+local function do_request(label, request, timeout_pair)
+    if socketutil and socketutil.set_timeout then
+        if timeout_pair then
+            socketutil:set_timeout(timeout_pair[1], timeout_pair[2])
+        else
+            socketutil:set_timeout()
+        end
+    end
+    local _, code, headers, status = http.request(request)
+    if socketutil and socketutil.reset_timeout then
+        socketutil:reset_timeout()
+    end
+    logger.dbg(string.format(
+        "webdav_autosync: %s url=%s status=%s",
+        label, request.url, tostring(code)))
+    return code, headers, status
+end
+
 --- List a WebDAV URL (single level). Returns list of { href, is_collection, path }.
 --- Matches KOReader WebDavApi: trailing slash on URL, empty body, Content-Length, user/password, socketutil.
 local function list_one(url, username, password, depth)
@@ -152,36 +180,25 @@ local function list_one(url, username, password, depth)
     if not url_has_host(url) then
         return nil, nil, "host or service not provided, or not known"
     end
-    -- WebDavApi: "URL *must* have a trailing /" for PROPFIND on collection
-    if url:sub(-1) ~= "/" then
-        url = url .. "/"
-    end
+    if url:sub(-1) ~= "/" then url = url .. "/" end
     depth = depth or "1"
     local body = {}
-    local request = {
-        url = url,
-        method = "PROPFIND",
-        headers = {
-            ["Content-Type"] = "application/xml",
-            ["Depth"] = depth,
-            ["Content-Length"] = #PROPFIND_BODY,
-        },
-        source = ltn12.source.string(PROPFIND_BODY),
-        sink = ltn12.sink.table(body),
-        user = (username and username ~= "") and username or nil,
-        password = (password and password ~= "") and password or nil,
-    }
-    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " depth=" .. tostring(depth))
-    if socketutil and socketutil.set_timeout then
-        socketutil:set_timeout()
-    end
-    local code, _, status = socket.skip(1, http.request(request))
-    if socketutil and socketutil.reset_timeout then
-        socketutil:reset_timeout()
-    end
+    local code, _, status = do_request(
+        "PROPFIND", {
+            url = url,
+            method = "PROPFIND",
+            headers = {
+                ["Content-Type"] = "application/xml",
+                ["Depth"] = depth,
+                ["Content-Length"] = #PROPFIND_BODY,
+            },
+            source = ltn12.source.string(PROPFIND_BODY),
+            sink = ltn12.sink.table(body),
+            user = (username and username ~= "") and username or nil,
+            password = (password and password ~= "") and password or nil,
+        })
     local body_str = table.concat(body)
     if type(code) ~= "number" or code < 200 or code > 299 then
-        logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " status=" .. tostring(code))
         -- Truncate body for the error return: servers typically reply with
         -- multi-KB HTML on 4xx/5xx, and the caller surfaces this string in
         -- an InfoMessage popup. Keep the first 200 chars so the dialog stays
@@ -191,7 +208,7 @@ local function list_one(url, username, password, depth)
         return nil, code or status, err_msg
     end
     local list = parse_propfind_response(body_str)
-    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " status=" .. tostring(code) .. " entries=" .. tostring(#list))
+    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " entries=" .. tostring(#list))
     return list, code
 end
 
@@ -215,33 +232,25 @@ local function get_props(url, username, password)
     -- cache then carried `etag_from_put` but no `remote_mtime`.
     url = url_encode(url)
     local body = {}
-    local request = {
-        url = url,
-        method = "PROPFIND",
-        headers = {
-            ["Content-Type"] = "application/xml",
-            ["Depth"] = "0",
-            ["Content-Length"] = #PROPFIND_BODY,
-        },
-        source = ltn12.source.string(PROPFIND_BODY),
-        sink = ltn12.sink.table(body),
-        user = (username and username ~= "") and username or nil,
-        password = (password and password ~= "") and password or nil,
-    }
-    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " depth=0")
-    if socketutil and socketutil.set_timeout then
-        socketutil:set_timeout()
-    end
-    local code, _, status = socket.skip(1, http.request(request))
-    if socketutil and socketutil.reset_timeout then
-        socketutil:reset_timeout()
-    end
+    local code = do_request(
+        "PROPFIND depth=0", {
+            url = url,
+            method = "PROPFIND",
+            headers = {
+                ["Content-Type"] = "application/xml",
+                ["Depth"] = "0",
+                ["Content-Length"] = #PROPFIND_BODY,
+            },
+            source = ltn12.source.string(PROPFIND_BODY),
+            sink = ltn12.sink.table(body),
+            user = (username and username ~= "") and username or nil,
+            password = (password and password ~= "") and password or nil,
+        })
     if type(code) ~= "number" or code < 200 or code > 299 then
-        logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " depth=0 status=" .. tostring(code))
-        return nil, code or status
+        return nil, code
     end
     local list = parse_propfind_response(table.concat(body))
-    logger.dbg("webdav_autosync: PROPFIND url=" .. url .. " depth=0 status=" .. tostring(code) .. " entries=" .. tostring(#list))
+    logger.dbg("webdav_autosync: PROPFIND depth=0 url=" .. url .. " entries=" .. tostring(#list))
     return list[1]
 end
 
@@ -388,21 +397,13 @@ local function download_file(remote_url, local_path, username, password)
     end
     local f, ferr = io.open(local_path, "wb")
     if not f then return nil, ferr end
-    local request = {
+    local code = do_request("GET", {
         url = url,
         method = "GET",
         sink = ltn12.sink.file(f), -- closes f on EOF/error
         user = (username and username ~= "") and username or nil,
         password = (password and password ~= "") and password or nil,
-    }
-    if socketutil and socketutil.set_timeout then
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
-    end
-    local code = socket.skip(1, http.request(request))
-    if socketutil and socketutil.reset_timeout then
-        socketutil:reset_timeout()
-    end
-    logger.dbg("webdav_autosync: GET url=" .. url .. " status=" .. tostring(code))
+    }, socketutil and { socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT } or nil)
     if type(code) ~= "number" or code ~= 200 then
         os.remove(local_path)
         return nil, "HTTP " .. tostring(code)
@@ -418,21 +419,13 @@ local function mkcol(remote_url, username, password)
     local url = url_encode(normalize_url(remote_url))
     if url:sub(-1) ~= "/" then url = url .. "/" end
     local body = {}
-    local request = {
+    local code = do_request("MKCOL", {
         url = url,
         method = "MKCOL",
         sink = ltn12.sink.table(body),
         user = (username and username ~= "") and username or nil,
         password = (password and password ~= "") and password or nil,
-    }
-    if socketutil and socketutil.set_timeout then
-        socketutil:set_timeout()
-    end
-    local code = socket.skip(1, http.request(request))
-    if socketutil and socketutil.reset_timeout then
-        socketutil:reset_timeout()
-    end
-    logger.dbg("webdav_autosync: MKCOL url=" .. url .. " status=" .. tostring(code))
+    })
     if type(code) == "number" and ((code >= 200 and code < 300) or code == 405) then
         return true
     end
@@ -473,7 +466,7 @@ local function upload_file(remote_url, local_path, username, password)
 
     local url = url_encode(normalize_url(remote_url))
     local response_body = {}
-    local request = {
+    local code, headers = do_request("PUT", {
         url = url,
         method = "PUT",
         headers = {
@@ -484,15 +477,7 @@ local function upload_file(remote_url, local_path, username, password)
         sink = ltn12.sink.table(response_body),
         user = (username and username ~= "") and username or nil,
         password = (password and password ~= "") and password or nil,
-    }
-    if socketutil and socketutil.set_timeout then
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
-    end
-    local _, code, headers = http.request(request)
-    if socketutil and socketutil.reset_timeout then
-        socketutil:reset_timeout()
-    end
-    logger.dbg("webdav_autosync: PUT url=" .. url .. " size=" .. tostring(size) .. " status=" .. tostring(code))
+    }, socketutil and { socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT } or nil)
     if type(code) ~= "number" or code < 200 or code > 299 then
         return nil, "HTTP " .. tostring(code)
     end
