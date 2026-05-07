@@ -17,6 +17,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local logger = require("logger")
 local settings = require("settings")
+local triggers = require("triggers")
 local sync = require("sync")
 local webdav = require("webdav")
 local T = require("ffi/util").template
@@ -32,147 +33,6 @@ local WebDAVSync = WidgetContainer:extend{
     -- broadcasts collapse into a single sync.
     is_doc_only = false,
 }
-
--- Two independent cooldowns:
---   * full-reconcile  — gated by `webdav_autosync_last_auto_run_at` +
---     `get_cooldown()`. Covers Resume, startup, and the chained book
---     auto-sync. Default 300 s.
---   * close-trigger   — gated by `webdav_autosync_last_close_run_at` +
---     `get_close_cooldown()`. Covers the scoped close trigger (one
---     PROPFIND on the just-closed book's `.sdr/`). Default 30 s.
---
--- The two timestamps are independent: a close-triggered sync does NOT push
--- back the next full reconcile, and a Resume/startup sync does NOT push back
--- the next close trigger. That keeps each path's debounce limited to its own
--- redundancy case (same book closed twice in quick succession; multiple
--- wakes in quick succession) without one suppressing the other.
---
--- Both timestamps (and the close-trigger's `last_close_book_rel` carve-out)
--- live in the plugin's state file `<settings_dir>/webdav_autosync_state.lua`
--- under their own keys, alongside the per-file `files` table the planners
--- use. Pre-v1.7.3 they were module-local Lua values that defaulted to 0 on
--- every process start, which made the *startup* trigger always pass
--- `should_run_auto()` regardless of how recently the previous KOReader
--- session had synced — exactly the "two startups in quick succession" case
--- the cooldown is supposed to catch. The same was true for the close
--- timestamp and `last_close_book_rel` (close-then-restart-then-close-of-
--- same-book bypassed the carve-out). Persisting fixes all three.
---
--- Why the state file and not `G_reader_settings`: these are sync-state
--- runtime values, not user configuration. Wiping the state file (e.g. to
--- force a fresh baseline) should reset the cooldowns too — that's what
--- happens automatically when they live alongside the per-file cache rows.
--- The cost is one extra explicit flush per `mark_*_run` (G_reader_settings
--- piggybacks on KOReader's lifecycle flush); we accept that for tighter
--- crash-recovery (timestamps are durable as soon as a sync runs).
---
--- last_close_book_rel carves out the per-book exception for the close
--- trigger: closing a *different* book hits a different `.sdr/`, so it's not
--- redundant with the prior sync and is allowed regardless of the close
--- cooldown. Closing the *same* book within the cooldown is the redundant
--- case we skip.
---
--- Set true the first time init() schedules its startup sync this KOReader
--- process. Each FileManager↔ReaderUI transition re-instantiates the plugin
--- and re-runs init(); without this guard, opening a book or closing it back
--- to the file manager would re-fire a full-library progress sync (and the
--- chained book sync on the close-into-FM transition) every time the
--- in-process scheduling slot was free. Distinct from the cooldown — the
--- cooldown is the cross-trigger throttle (whether ANY sync ran recently),
--- this boolean is "did the startup-specific scheduleIn fire already in
--- THIS process". Module-local because we want to fire startup at most once
--- per process even if the persistent cooldown would otherwise admit it
--- (e.g. user toggled cooldown to 0).
-local startup_sync_scheduled = false
-
--- Wi-Fi reconnect after Suspend is async on KOReader devices that bring
--- the network up lazily (Kindle, Kobo); isOnline() (a real-time DNS
--- probe at frontend/ui/network/manager.lua:588) returns false for
--- several seconds after onResume fires. KOReader's willRerunWhenOnline
--- and runWhenOnline helpers don't fit our case: when isConnected() (the
--- cached flag) is true but isOnline() (DNS) currently fails, they call
--- beforeWifiAction *without* the callback (manager.lua@v2026.03 lines
--- 679-680, "Avoid infinite recursion, beforeWifiAction only guarantees
--- isConnected, not isOnline") — the caller is left waiting on an event
--- nobody will fire. Those helpers are also tied to the
--- wifi_enable_action state machine, which an auto trigger has no
--- business engaging — manual triggers prompt via ConfirmBox; auto
--- triggers should be invisible. Hence: poll isOnline() ourselves with
--- bounded retries. Same approach for Resume and post-init startup;
--- each retry re-runs the full handler from the top so toggle/cooldown
--- changes during the wait take effect immediately.
-local AUTO_TRIGGER_NET_RETRY_INTERVAL_SECS = 5
-local AUTO_TRIGGER_NET_RETRY_MAX = 6  -- ~30 s total
-
--- Resume settle delay. Resume on Kindle (and likely other lipc-driven
--- platforms) fires for *every* powerd-reported wake, including the brief
--- unscheduled wakes the system schedules for its own background tasks
--- (RTC alarms, hall-sensor twitches, USB/network housekeeping). Without
--- a settle delay, our sync runs in those tiny wake windows and burns
--- the cooldown for nothing.
---
--- KOReader's own classifier (frontend/device/kindle/powerd.lua:258-269,
--- `KindlePowerD:checkUnexpectedWakeup`) waits 15 s after wakeup and reads
--- `getPowerdState()`: if state is still "screenSaver" or "suspended", the
--- wake was unscheduled. We mirror that window by default (see
--- `DEFAULT_RESUME_SETTLE`); user-configurable via `setResumeSettle`.
---
--- Two complementary mechanisms gate at fire time:
---   1. Cross-platform — onSuspend cancels the pending defer before it
---      fires. On Kindle the back-to-sleep edge after a brief unscheduled
---      wake usually goes screenSaver → suspended without firing
---      `goingToScreenSaver`, so onSuspend may not fire; in that case the
---      CPU is suspended before our scheduled task can run. Either way,
---      the deferred fn does not execute while the device is asleep.
---   2. Kindle-only — at fire time, read powerd state. If it's still
---      "screenSaver" or "suspended" after the settle delay, the wake was
---      unscheduled and we explicitly skip (see is_unscheduled_kindle_wake).
---
--- Setting the delay to 0 disables both gates: onResume runs sync inline
--- (skipping the Kindle state check). That's the pre-1.7.8 behavior —
--- offered as an opt-out for users who'd rather see immediate sync UI on
--- wake at the cost of unnecessary work on brief system wakes.
-
--- Module-local because the plugin is instantiated twice (FileManager and
--- ReaderUI). Resume / Suspend broadcast to both instances; we want a single
--- shared pending fn so the second instance's onResume sees that one is
--- already scheduled, and either instance's onSuspend can cancel it.
-local pending_resume_sync_fn = nil
-
--- Read Kindle's powerd state via `KindlePowerD:getPowerdState()` (a
--- thin wrapper around `lipc.get_string_property("com.lab126.powerd",
--- "state")`). Returns nil on non-Kindle, when lipc isn't available, or
--- on error. The state strings we care about are "screenSaver" and
--- "suspended" — anything else (e.g. "active", "ready") means the user
--- has actually engaged with the device.
-local function read_powerd_state()
-    local ok_dev, Device = pcall(require, "device")
-    if not ok_dev or not Device then return nil end
-    if not Device.isKindle or not Device:isKindle() then return nil end
-    local powerd = Device.getPowerDevice and Device:getPowerDevice()
-    if not powerd or not powerd.getPowerdState then return nil end
-    local ok, state = pcall(function() return powerd:getPowerdState() end)
-    if not ok then return nil end
-    return state
-end
-
--- True iff we're on Kindle AND powerd reports the device is back in
--- screensaver/suspended after the settle delay — the canonical "this
--- was an unscheduled wake" signal. Non-Kindle devices fall through
--- (read_powerd_state returns nil → returns false; the cross-platform
--- defer/cancel mechanism is the only gate there).
-local function is_unscheduled_kindle_wake()
-    local state = read_powerd_state()
-    if state == nil then return false end
-    return state == "screenSaver" or state == "suspended"
-end
-
-local function cancel_pending_resume_sync(reason)
-    if not pending_resume_sync_fn then return end
-    UIManager:unschedule(pending_resume_sync_fn)
-    pending_resume_sync_fn = nil
-    logger.dbg("webdav_autosync: trigger=resume cancelled reason=" .. reason)
-end
 
 -- Stats accumulator for the chain (progress sync → book auto-sync) used
 -- on Resume and on the startup hook in init(). When `chain_stats` is set
@@ -258,80 +118,15 @@ local function run_action_loop(plan_obj, stats, on_action_failure)
     end
 end
 
-local function defer_until_online(label, retries_left, retry_fn)
-    local NetworkMgr = require("ui/network/manager")
-    -- isOnline() is just a DNS probe (canResolveHostnames at
-    -- manager.lua:314, `socket.dns.toip("dns.msftncsi.com")`) — DNS
-    -- can succeed against cached records before the kernel routing
-    -- table is populated. We've seen the resulting failure mode in
-    -- the wild: isOnline() returns true on the first retry after
-    -- Resume, the sync proceeds, and the very next PROPFIND fails
-    -- with "Network is unreachable" (the OS-level errno from a
-    -- routeless socket). hasDefaultRoute (manager.lua:285) catches
-    -- that — it does a UDP setpeername on a documentation-range IP
-    -- (203.0.113.1 / 2001:db8::1) which returns false in exactly
-    -- the no-route state. Require both. Defensive existence checks
-    -- match the pattern used elsewhere; on a hypothetical older
-    -- KOReader build that lacks one or the other, the missing check
-    -- is treated as pass.
-    local online = (NetworkMgr.isOnline == nil) or NetworkMgr:isOnline()
-    local has_route = (NetworkMgr.hasDefaultRoute == nil) or NetworkMgr:hasDefaultRoute()
-    if online and has_route then
-        return false  -- caller proceeds inline
-    end
-    if retries_left <= 0 then
-        logger.dbg(string.format(
-            "webdav_autosync: %s skip reason=offline-give-up online=%s has_route=%s",
-            label, tostring(online), tostring(has_route)))
-        return true
-    end
-    logger.dbg(string.format(
-        "webdav_autosync: %s defer reason=offline online=%s has_route=%s retries_left=%d",
-        label, tostring(online), tostring(has_route), retries_left))
-    UIManager:scheduleIn(AUTO_TRIGGER_NET_RETRY_INTERVAL_SECS,
-        function() retry_fn(retries_left - 1) end)
-    return true
+-- Temporary bridge methods for triggers.lua (Task 2). triggers.dispatch_auto_chain
+-- calls these via the bound plugin instance. They wrap the module-locals above.
+-- These three methods move to runner.lua in Task 3 and are deleted here.
+function WebDAVSync:make_empty_chain_stats()
+    return make_empty_chain_stats()
 end
 
--- In-flight guard. Both book sync and progress sync mutate the same
--- on-disk LuaSettings cache (webdav_autosync_state.lua). If a sync
--- is paused on the conflict dialog and the user kicks off a second
--- sync from the menu, both runs load cache_files independently, mutate
--- their own copy, and the second flush clobbers the first's writes —
--- with the visible failure mode of cache rows reverting and files being
--- re-classified as "changed" on the next run. The guard is a single
--- module-local boolean covering every sync flow (book one-way, book
--- two-way, progress full-library, progress scoped close).
---
--- Held across the conflict dialog chain so a tap on "Sync books now"
--- mid-conflict is rejected with a user-visible message rather than
--- racing on save_cache. Cleared on every runner exit path.
---
--- Limitation: if a conflict dialog is dismissed via back-button or
--- tap-outside (rather than picking a button), `finish()` is never
--- called, the flag stays set, and subsequent auto syncs no-op until
--- KOReader restarts. The cache flush leaks the same way regardless,
--- so this isn't a regression — it's the same shape of pre-existing
--- limitation, made visible by the new flag.
-local sync_in_flight = false
-
-local function check_in_flight(label, manual)
-    if not sync_in_flight then return false end
-    logger.info("webdav_autosync: " .. label .. " skip reason=already-in-flight")
-    if manual then
-        UIManager:show(InfoMessage:new{
-            text = _("A WebDAV sync is already in progress."),
-        })
-    end
-    return true
-end
-
-local function acquire_sync_lock()
-    sync_in_flight = true
-end
-
-local function release_sync_lock()
-    sync_in_flight = false
+function WebDAVSync:chain_total_failed(chain_stats)
+    return chain_total_failed(chain_stats)
 end
 
 function WebDAVSync:init()
@@ -347,81 +142,11 @@ function WebDAVSync:init()
         title = _("WebDAV sync reading progress now"),
         general = true,
     })
+    triggers.bind(self)
     self.ui.menu:registerToMainMenu(self)
     local ui_kind = (self.ui and self.ui.document) and "reader" or "filemanager"
     logger.dbg("webdav_autosync: init ui=" .. ui_kind)
-    -- Startup is an interactive trigger: surface deferred conflicts via
-    -- dialog. Per-event toggles gate the call site (no need to invoke a
-    -- runner whose toggle is off); the runners still bail on no-config /
-    -- offline / wrong metadata-folder mode internally. Chained via on_done
-    -- — progress first, then book — so the conflict dialog chains never
-    -- overlap on screen. Cooldown is consumed up here so the chain counts
-    -- as a single auto-trigger slot.
-    --
-    -- Only schedule once per KOReader process — see the comment on
-    -- startup_sync_scheduled above. Subsequent init() calls (from the
-    -- FM↔Reader transition's fresh plugin instance) skip this block.
-    if startup_sync_scheduled then
-        logger.dbg("webdav_autosync: init skip startup-sync (already scheduled this process) ui=" .. ui_kind)
-        return
-    end
-    startup_sync_scheduled = true
-    logger.dbg("webdav_autosync: init scheduling startup sync in 2s ui=" .. ui_kind)
-    UIManager:scheduleIn(2, function()
-        local function run_startup_sync(retries_left)
-            local progress_on = settings.event_enabled("progress_on_startup")
-            local books_on = settings.event_enabled("books_on_startup")
-            if not progress_on and not books_on then
-                logger.dbg("webdav_autosync: trigger=startup skip reason=disabled")
-                return
-            end
-            if not settings.should_run_auto() then
-                logger.dbg("webdav_autosync: trigger=startup skip reason=cooldown")
-                return
-            end
-            if defer_until_online("trigger=startup",
-                retries_left or AUTO_TRIGGER_NET_RETRY_MAX,
-                run_startup_sync) then
-                return
-            end
-            settings.mark_auto_run()
-            logger.info(string.format(
-                "webdav_autosync: trigger=startup progress=%s books=%s",
-                tostring(progress_on), tostring(books_on)))
-            -- Startup runs in silent_mode like Resume: no "Syncing…"
-            -- InfoMessage during the run, no summary popup at the end
-            -- unless something failed. Conflict dialogs still surface
-            -- (handled inside the runners). The chain branch shows a
-            -- single merged summary IFF total failed > 0.
-            if progress_on and books_on then
-                local chain_stats = make_empty_chain_stats()
-                self:doProgressSync({
-                    trigger = "startup",
-                    silent_mode = true,
-                    chain_stats = chain_stats,
-                    on_done = function()
-                        self:maybeRunBookAutoSync({
-                            silent_mode = true,
-                            chain_stats = chain_stats,
-                            on_done = function()
-                                if chain_total_failed(chain_stats) > 0 then
-                                    self:showChainSummary(chain_stats)
-                                end
-                            end,
-                        })
-                    end,
-                })
-            elseif progress_on then
-                self:doProgressSync({
-                    trigger = "startup",
-                    silent_mode = true,
-                })
-            else
-                self:maybeRunBookAutoSync({ silent_mode = true })
-            end
-        end
-        run_startup_sync()
-    end)
+    triggers.schedule_startup_sync()
 end
 
 function WebDAVSync:addToMainMenu(menu_items)
@@ -677,132 +402,12 @@ function WebDAVSync:onCloseDocument()
     self:doProgressSyncForBook(book_rel)
 end
 
--- Resume: interactive for both syncs. The user is present, so conflicts pile
--- up here as dialogs. We chain progress → book auto-sync via on_done so the
--- two dialog chains can't end up stacked on screen at the same time; book
--- sync starts only once progress sync has fully resolved its conflicts.
--- Cooldown is consumed in runResumeSync so the chain counts as a single auto
--- slot.
---
--- Resume defers the actual sync work by `get_resume_settle()` seconds to
--- filter out brief unscheduled wakes (see big comment block above). The
--- cheap toggle gate runs here so we don't even schedule when both sync
--- types are off. Toggles, cooldown, and the Kindle powerd-state gate all
--- re-run at fire time in runResumeSync — they may have changed during the
--- wait. Setting the delay to 0 bypasses the defer and the Kindle state
--- gate (pre-1.7.8 behavior).
 function WebDAVSync:onResume()
-    local progress_on = settings.event_enabled("progress_on_resume")
-    local books_on = settings.event_enabled("books_on_resume")
-    if not progress_on and not books_on then
-        logger.dbg("webdav_autosync: trigger=resume skip reason=disabled")
-        return
-    end
-    local delay = settings.get_resume_settle()
-    if delay <= 0 then
-        -- User opted out of the settle gate. Run inline, skipping the
-        -- Kindle unscheduled-wake check (which only makes sense after a
-        -- non-zero settle delay).
-        self:runResumeSync(nil, { skip_unscheduled_check = true })
-        return
-    end
-    -- Both plugin instances (FM and Reader) receive Resume; collapse to a
-    -- single pending defer. Repeated Resume broadcasts inside the settle
-    -- window (e.g. unscheduled wake → real user wake before t+delay) leave
-    -- the original defer in place; whichever wake is "real" will pass the
-    -- fire-time Kindle state gate.
-    if pending_resume_sync_fn then
-        logger.dbg("webdav_autosync: trigger=resume skip reason=already-scheduled")
-        return
-    end
-    local fn
-    fn = function()
-        pending_resume_sync_fn = nil
-        self:runResumeSync()
-    end
-    pending_resume_sync_fn = fn
-    logger.dbg("webdav_autosync: trigger=resume defer secs=" .. tostring(delay))
-    UIManager:scheduleIn(delay, fn)
+    triggers.on_resume()
 end
 
--- Cancel any pending deferred Resume sync if the device suspends again
--- before the settle delay elapses. Does NOT initiate any sync work — the
--- onSuspend handler exists solely as the cancel hook for the Resume
--- defer. Don't reintroduce a sync-on-suspend codepath here.
 function WebDAVSync:onSuspend()
-    cancel_pending_resume_sync("suspend")
-end
-
--- Fire-time gating + sync. Re-checks toggles and cooldown (they may have
--- changed in the settle window) and applies the Kindle unscheduled-wake
--- gate, then enters the existing online-defer / sync chain. The retries
--- arg threads through online-defer's recursive callback; KOReader's
--- Resume broadcast has no payload, so onResume itself doesn't take it.
--- opts.skip_unscheduled_check: set true when called inline from onResume's
--- delay==0 path; the Kindle state check would (incorrectly) skip every
--- Resume there because powerd is still in screenSaver right at wake.
-function WebDAVSync:runResumeSync(retries_left, opts)
-    opts = opts or {}
-    local progress_on = settings.event_enabled("progress_on_resume")
-    local books_on = settings.event_enabled("books_on_resume")
-    if not progress_on and not books_on then
-        logger.dbg("webdav_autosync: trigger=resume skip reason=disabled")
-        return
-    end
-    if not settings.should_run_auto() then
-        logger.dbg("webdav_autosync: trigger=resume skip reason=cooldown")
-        return
-    end
-    -- Kindle-only: the settle delay matches KindlePowerD's own classifier
-    -- window, so reading powerd state here gives the same verdict KOReader
-    -- itself uses for `Kindle (un)scheduled wakeup` — no inference needed.
-    -- Non-Kindle devices fall through (state==nil); they're protected by
-    -- the cross-platform defer + onSuspend cancel + CPU-suspended-during-
-    -- sleep mechanism.
-    if not opts.skip_unscheduled_check and is_unscheduled_kindle_wake() then
-        logger.dbg("webdav_autosync: trigger=resume skip reason=unscheduled-wake state="
-            .. tostring(read_powerd_state()))
-        return
-    end
-    if defer_until_online("trigger=resume",
-        retries_left or AUTO_TRIGGER_NET_RETRY_MAX,
-        function(n) self:runResumeSync(n, opts) end) then
-        return
-    end
-    settings.mark_auto_run()
-    logger.info(string.format(
-        "webdav_autosync: trigger=resume progress=%s books=%s",
-        tostring(progress_on), tostring(books_on)))
-    -- Resume runs in silent_mode: no "Syncing…" popups, and the summary
-    -- popup fires only if something failed. Conflicts still pop the dialog
-    -- chain. When both progress and book sync run, accumulate into
-    -- chain_stats and show ONE merged summary IFF total failures > 0.
-    if progress_on and books_on then
-        local chain_stats = make_empty_chain_stats()
-        self:doProgressSync({
-            trigger = "resume",
-            silent_mode = true,
-            chain_stats = chain_stats,
-            on_done = function()
-                self:maybeRunBookAutoSync({
-                    silent_mode = true,
-                    chain_stats = chain_stats,
-                    on_done = function()
-                        if chain_total_failed(chain_stats) > 0 then
-                            self:showChainSummary(chain_stats)
-                        end
-                    end,
-                })
-            end,
-        })
-    elseif progress_on then
-        self:doProgressSync({
-            trigger = "resume",
-            silent_mode = true,
-        })
-    else
-        self:maybeRunBookAutoSync({ silent_mode = true })
-    end
+    triggers.on_suspend()
 end
 
 function WebDAVSync:setWebDAVServer()
@@ -1006,12 +611,7 @@ function WebDAVSync:setResumeSettle()
         ok_text = _("Set"),
         callback = function(spin)
             G_reader_settings:saveSetting("webdav_autosync_resume_settle_seconds", spin.value)
-            -- If the user just set it to 0 while a defer is pending, kill
-            -- the pending fn so it doesn't fire later under the now-stale
-            -- "user wants the gate" assumption. Cheap and surprise-free.
-            if spin.value <= 0 then
-                cancel_pending_resume_sync("setting changed to 0")
-            end
+            triggers.on_resume_settle_changed(spin.value)
         end,
     })
 end
@@ -1068,7 +668,7 @@ function WebDAVSync:doSync(opts)
     local chain_stats = opts.chain_stats
     local on_done = opts.on_done
 
-    if check_in_flight("book sync", not is_auto) then
+    if triggers.check_in_flight("book sync", not is_auto) then
         if on_done then on_done() end
         return
     end
@@ -1148,7 +748,7 @@ function WebDAVSync:doSync(opts)
 end
 
 function WebDAVSync:runOneWaySync(ctx)
-    acquire_sync_lock()
+    triggers.acquire_sync_lock()
     -- silent_mode = true is the auto-trigger UI: no "Syncing…" InfoMessage
     -- during the run, no summary popup at the end UNLESS something failed.
     -- Conflict resolution dialogs and plan-failure popups are unaffected
@@ -1210,12 +810,12 @@ function WebDAVSync:runOneWaySync(ctx)
     -- Files that did get written still trigger a refresh, even when err is set.
     self:notifyLibraryRefresh(ctx.folder, downloaded_rels)
     self:turnOffWifiIfRequested(ctx)
-    release_sync_lock()
+    triggers.release_sync_lock()
     if ctx.on_done then ctx.on_done() end
 end
 
 function WebDAVSync:runTwoWaySync(ctx)
-    acquire_sync_lock()
+    triggers.acquire_sync_lock()
     -- See runOneWaySync for silent_mode semantics — same here.
     local silent_mode = ctx.silent_mode == true
     local chain_stats = ctx.chain_stats
@@ -1249,7 +849,7 @@ function WebDAVSync:runTwoWaySync(ctx)
             })
         end
         self:turnOffWifiIfRequested(ctx)
-        release_sync_lock()
+        triggers.release_sync_lock()
         if ctx.on_done then ctx.on_done() end
         return
     end
@@ -1274,7 +874,7 @@ function WebDAVSync:runTwoWaySync(ctx)
             self:showSummary(_("Sync done."), stats)
         end
         self:turnOffWifiIfRequested(ctx)
-        release_sync_lock()
+        triggers.release_sync_lock()
         if ctx.on_done then ctx.on_done() end
     end
 
@@ -1563,7 +1163,7 @@ function WebDAVSync:doProgressSync(opts)
     local chain_stats = opts.chain_stats
     local function done() if on_done then on_done() end end
 
-    if check_in_flight("progress sync", manual) then return done() end
+    if triggers.check_in_flight("progress sync", manual) then return done() end
 
     -- The per-event toggle gating happens in the event handlers (init,
     -- onResume) before they call us; manual entry points bypass the toggles
@@ -1661,7 +1261,7 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
     -- Gating (master + progress_on_close) is enforced by onCloseDocument
     -- before this runs; we don't re-check here.
 
-    if check_in_flight("close-trigger sync", false) then return end
+    if triggers.check_in_flight("close-trigger sync", false) then return end
 
     local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
     if meta_mode ~= "doc" then
@@ -1687,7 +1287,7 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
 
     -- Past the cheap config gates: from here on we'll touch the cache and the
     -- network, so claim the in-flight lock. Released on every exit below.
-    acquire_sync_lock()
+    triggers.acquire_sync_lock()
 
     local username = settings.get("username", "")
     local password = settings.get("password", "")
@@ -1700,7 +1300,7 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
         UIManager:show(InfoMessage:new{
             text = T(_("Progress sync failed: %1"), tostring(err)),
         })
-        release_sync_lock()
+        triggers.release_sync_lock()
         return
     end
 
@@ -1723,7 +1323,7 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
         if stats.failed > 0 then
             self:showSummary(_("Reading progress synced."), stats)
         end
-        release_sync_lock()
+        triggers.release_sync_lock()
     end
 
     if #conflicts == 0 then
@@ -1756,7 +1356,7 @@ function WebDAVSync:runProgressSync(opts)
     local chain_stats = opts.chain_stats
     local function done() if on_done then on_done() end end
 
-    acquire_sync_lock()
+    triggers.acquire_sync_lock()
     local username = settings.get("username", "")
     local password = settings.get("password", "")
 
@@ -1789,7 +1389,7 @@ function WebDAVSync:runProgressSync(opts)
                 text = T(_("Progress sync failed: %1"), tostring(err)),
             })
         end
-        release_sync_lock()
+        triggers.release_sync_lock()
         return done()
     end
 
@@ -1815,7 +1415,7 @@ function WebDAVSync:runProgressSync(opts)
         elseif (not silent_mode) or stats.failed > 0 then
             self:showSummary(_("Reading progress synced."), stats)
         end
-        release_sync_lock()
+        triggers.release_sync_lock()
         done()
     end
 
