@@ -3,13 +3,15 @@
 # Targets:
 #   make lint   - selene static analysis (semantic checks)
 #   make parse  - LuaJIT parse-check every .lua file (grammar check)
-#   make check  - lint + parse (run before committing)
+#   make smoke  - runtime require-chain smoke test (catches require cycles
+#                 that parse-only checks can't see)
+#   make check  - lint + parse + smoke (run before committing)
 #   make help   - this listing
 
 LUA_FILES := $(wildcard *.lua)
 
 .DEFAULT_GOAL := help
-.PHONY: help lint parse check
+.PHONY: help lint parse smoke check
 
 help:
 	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-8s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -27,4 +29,7 @@ parse: ## Parse-check every .lua file with LuaJIT
 		echo "ok   $$f"; \
 	done
 
-check: lint parse ## Run lint and parse together
+smoke: ## Runtime require-chain smoke test
+	@luajit tools/smoke-load.lua
+
+check: lint parse smoke ## Run lint + parse + smoke together
