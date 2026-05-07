@@ -761,29 +761,6 @@ local function save_cache(p)
     logger.dbg("webdav_autosync: cache flushed rows=" .. tostring(count_keys(p.cache_files)))
 end
 
---- Generic read of a single key from the plugin's state file. Used by
---- main.lua for cooldown timestamps and per-book carve-out (auto-trigger
---- bookkeeping that needs to survive a KOReader restart). Distinct from
---- the per-file `files` table that the planners read/write — same
---- LuaSettings, separate keys.
-local function read_state(key)
-    local cache = open_cache()
-    return cache:readSetting(key)
-end
-
---- Generic batch write of state keys. Opens the cache, sets each k/v,
---- flushes immediately so the values are durable before the next event.
---- Use a batch (not a sequence of single writes) when updating related
---- keys together so a single flush covers the set — both for cost and
---- for the "all or nothing" property under abrupt termination.
-local function write_state(updates)
-    local cache = open_cache()
-    for k, v in pairs(updates) do
-        cache:saveSetting(k, v)
-    end
-    cache:flush()
-end
-
 return {
     run_sync = run_sync,
     plan = plan,
@@ -791,7 +768,5 @@ return {
     plan_progress_book = plan_progress_book,
     do_action = do_action,
     save_cache = save_cache,
-    read_state = read_state,
-    write_state = write_state,
     KOREADER_DEFAULT_EXTENSIONS = KOREADER_DEFAULT_EXTENSIONS,
 }

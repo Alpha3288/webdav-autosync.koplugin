@@ -16,6 +16,7 @@ local Event = require("ui/event")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local logger = require("logger")
+local settings = require("settings")
 local sync = require("sync")
 local webdav = require("webdav")
 local T = require("ffi/util").template
@@ -83,96 +84,6 @@ local WebDAVSync = WidgetContainer:extend{
 -- per process even if the persistent cooldown would otherwise admit it
 -- (e.g. user toggled cooldown to 0).
 local startup_sync_scheduled = false
-local DEFAULT_COOLDOWN = 300
-local COOLDOWN_MIN = 0
-local COOLDOWN_MAX = 1800
-local COOLDOWN_STEP = 30
-local DEFAULT_CLOSE_COOLDOWN = 30
-local CLOSE_COOLDOWN_MIN = 0
-local CLOSE_COOLDOWN_MAX = 600
-local CLOSE_COOLDOWN_STEP = 10
--- Resume settle delay setting bounds. Default 15 s matches KOReader's
--- KindlePowerD:checkUnexpectedWakeup window (the canonical "this was an
--- unscheduled wake" classifier reads powerd state 15 s after wakeup).
--- 0 disables the gate entirely — sync runs inline on Resume, which is
--- the pre-1.7.8 behavior. Max kept modest because longer delays just
--- annoy the user without catching meaningfully more unscheduled wakes.
-local DEFAULT_RESUME_SETTLE = 15
-local RESUME_SETTLE_MIN = 0
-local RESUME_SETTLE_MAX = 60
-local RESUME_SETTLE_STEP = 5
-
-local function get_cooldown()
-    local v = G_reader_settings and G_reader_settings:readSetting("webdav_autosync_cooldown_seconds")
-    if type(v) ~= "number" then return DEFAULT_COOLDOWN end
-    if v < COOLDOWN_MIN then return COOLDOWN_MIN end
-    if v > COOLDOWN_MAX then return COOLDOWN_MAX end
-    return v
-end
-
-local function get_close_cooldown()
-    local v = G_reader_settings and G_reader_settings:readSetting("webdav_autosync_close_cooldown_seconds")
-    if type(v) ~= "number" then return DEFAULT_CLOSE_COOLDOWN end
-    if v < CLOSE_COOLDOWN_MIN then return CLOSE_COOLDOWN_MIN end
-    if v > CLOSE_COOLDOWN_MAX then return CLOSE_COOLDOWN_MAX end
-    return v
-end
-
-local function get_resume_settle()
-    local v = G_reader_settings and G_reader_settings:readSetting("webdav_autosync_resume_settle_seconds")
-    if type(v) ~= "number" then return DEFAULT_RESUME_SETTLE end
-    if v < RESUME_SETTLE_MIN then return RESUME_SETTLE_MIN end
-    if v > RESUME_SETTLE_MAX then return RESUME_SETTLE_MAX end
-    return v
-end
-
-local function read_timestamp(key)
-    local v = sync.read_state(key)
-    return (type(v) == "number") and v or 0
-end
-
-local function read_string(key)
-    local v = sync.read_state(key)
-    return (type(v) == "string") and v or nil
-end
-
--- Master gate: when off, no auto trigger (startup, Resume, close) does
--- anything. Manual entry points (menu items, Dispatcher actions) bypass.
-local function is_master_on()
-    return G_reader_settings and G_reader_settings:isTrue("webdav_autosync_master")
-end
-
--- Per-event toggle, gated by the master. The master being off forces every
--- event toggle to read as off — handlers don't need to check both. Manual
--- runs do not pass through here.
-local function event_enabled(event_key)
-    if not is_master_on() then return false end
-    return G_reader_settings:isTrue("webdav_autosync_" .. event_key)
-end
-
-local function should_run_auto()
-    local cooldown = get_cooldown()
-    if cooldown <= 0 then return true end
-    return os.time() - read_timestamp("last_auto_run_at") >= cooldown
-end
-
-local function should_run_close(book_rel)
-    if book_rel ~= read_string("last_close_book_rel") then return true end
-    local cooldown = get_close_cooldown()
-    if cooldown <= 0 then return true end
-    return os.time() - read_timestamp("last_close_run_at") >= cooldown
-end
-
-local function mark_auto_run()
-    sync.write_state({ last_auto_run_at = os.time() })
-end
-
-local function mark_close_run(book_rel)
-    sync.write_state({
-        last_close_run_at = os.time(),
-        last_close_book_rel = book_rel,
-    })
-end
 
 -- Wi-Fi reconnect after Suspend is async on KOReader devices that bring
 -- the network up lazily (Kindle, Kobo); isOnline() (a real-time DNS
@@ -458,13 +369,13 @@ function WebDAVSync:init()
     logger.dbg("webdav_autosync: init scheduling startup sync in 2s ui=" .. ui_kind)
     UIManager:scheduleIn(2, function()
         local function run_startup_sync(retries_left)
-            local progress_on = event_enabled("progress_on_startup")
-            local books_on = event_enabled("books_on_startup")
+            local progress_on = settings.event_enabled("progress_on_startup")
+            local books_on = settings.event_enabled("books_on_startup")
             if not progress_on and not books_on then
                 logger.dbg("webdav_autosync: trigger=startup skip reason=disabled")
                 return
             end
-            if not should_run_auto() then
+            if not settings.should_run_auto() then
                 logger.dbg("webdav_autosync: trigger=startup skip reason=cooldown")
                 return
             end
@@ -473,7 +384,7 @@ function WebDAVSync:init()
                 run_startup_sync) then
                 return
             end
-            mark_auto_run()
+            settings.mark_auto_run()
             logger.info(string.format(
                 "webdav_autosync: trigger=startup progress=%s books=%s",
                 tostring(progress_on), tostring(books_on)))
@@ -521,14 +432,14 @@ function WebDAVSync:addToMainMenu(menu_items)
             {
                 text = _("Sync books now"),
                 callback = function()
-                    mark_auto_run()
+                    settings.mark_auto_run()
                     self:doSync()
                 end,
             },
             {
                 text = _("Sync reading progress now"),
                 callback = function()
-                    mark_auto_run()
+                    settings.mark_auto_run()
                     self:doProgressSync({ manual = true })
                 end,
             },
@@ -653,7 +564,7 @@ function WebDAVSync:addToMainMenu(menu_items)
                     },
                     {
                         text_func = function()
-                            return T(_("Auto sync cooldown: %1 s"), tostring(get_cooldown()))
+                            return T(_("Auto sync cooldown: %1 s"), tostring(settings.get_cooldown()))
                         end,
                         enabled_func = function()
                             return G_reader_settings:isTrue("webdav_autosync_master")
@@ -666,7 +577,7 @@ function WebDAVSync:addToMainMenu(menu_items)
                     },
                     {
                         text_func = function()
-                            return T(_("Close-trigger sync cooldown: %1 s"), tostring(get_close_cooldown()))
+                            return T(_("Close-trigger sync cooldown: %1 s"), tostring(settings.get_close_cooldown()))
                         end,
                         enabled_func = function()
                             return G_reader_settings:isTrue("webdav_autosync_master")
@@ -679,7 +590,7 @@ function WebDAVSync:addToMainMenu(menu_items)
                     },
                     {
                         text_func = function()
-                            local secs = get_resume_settle()
+                            local secs = settings.get_resume_settle()
                             if secs <= 0 then
                                 return _("Wake settle delay: 0 s (disabled)")
                             end
@@ -708,14 +619,14 @@ function WebDAVSync:addToMainMenu(menu_items)
 end
 
 function WebDAVSync:onWebDAVSyncNow()
-    mark_auto_run()
+    settings.mark_auto_run()
     logger.info("webdav_autosync: trigger=manual_books")
     self:doSync()
     return true
 end
 
 function WebDAVSync:onWebDAVProgressSyncNow()
-    mark_auto_run()
+    settings.mark_auto_run()
     logger.info("webdav_autosync: trigger=manual_progress")
     self:doProgressSync({ manual = true })
     return true
@@ -727,7 +638,7 @@ end
 -- within the cooldown is skipped. Conflicts are silently deferred — they
 -- re-surface at the next interactive trigger (Resume or startup).
 function WebDAVSync:onCloseDocument()
-    if not event_enabled("progress_on_close") then
+    if not settings.event_enabled("progress_on_close") then
         logger.dbg("webdav_autosync: trigger=close skip reason=disabled")
         return
     end
@@ -737,7 +648,7 @@ function WebDAVSync:onCloseDocument()
         return
     end
 
-    local local_folder = self:getSetting("download_folder", "")
+    local local_folder = settings.get("download_folder", "")
     if type(local_folder) ~= "string" or local_folder == "" then
         logger.dbg("webdav_autosync: trigger=close skip reason=no-download-folder")
         return
@@ -757,11 +668,11 @@ function WebDAVSync:onCloseDocument()
         return
     end
 
-    if not should_run_close(book_rel) then
+    if not settings.should_run_close(book_rel) then
         logger.dbg("webdav_autosync: trigger=close skip reason=debounce book=" .. book_rel)
         return
     end
-    mark_close_run(book_rel)
+    settings.mark_close_run(book_rel)
     logger.info("webdav_autosync: trigger=close book=" .. book_rel)
     self:doProgressSyncForBook(book_rel)
 end
@@ -781,13 +692,13 @@ end
 -- wait. Setting the delay to 0 bypasses the defer and the Kindle state
 -- gate (pre-1.7.8 behavior).
 function WebDAVSync:onResume()
-    local progress_on = event_enabled("progress_on_resume")
-    local books_on = event_enabled("books_on_resume")
+    local progress_on = settings.event_enabled("progress_on_resume")
+    local books_on = settings.event_enabled("books_on_resume")
     if not progress_on and not books_on then
         logger.dbg("webdav_autosync: trigger=resume skip reason=disabled")
         return
     end
-    local delay = get_resume_settle()
+    local delay = settings.get_resume_settle()
     if delay <= 0 then
         -- User opted out of the settle gate. Run inline, skipping the
         -- Kindle unscheduled-wake check (which only makes sense after a
@@ -832,13 +743,13 @@ end
 -- Resume there because powerd is still in screenSaver right at wake.
 function WebDAVSync:runResumeSync(retries_left, opts)
     opts = opts or {}
-    local progress_on = event_enabled("progress_on_resume")
-    local books_on = event_enabled("books_on_resume")
+    local progress_on = settings.event_enabled("progress_on_resume")
+    local books_on = settings.event_enabled("books_on_resume")
     if not progress_on and not books_on then
         logger.dbg("webdav_autosync: trigger=resume skip reason=disabled")
         return
     end
-    if not should_run_auto() then
+    if not settings.should_run_auto() then
         logger.dbg("webdav_autosync: trigger=resume skip reason=cooldown")
         return
     end
@@ -858,7 +769,7 @@ function WebDAVSync:runResumeSync(retries_left, opts)
         function(n) self:runResumeSync(n, opts) end) then
         return
     end
-    mark_auto_run()
+    settings.mark_auto_run()
     logger.info(string.format(
         "webdav_autosync: trigger=resume progress=%s books=%s",
         tostring(progress_on), tostring(books_on)))
@@ -894,28 +805,15 @@ function WebDAVSync:runResumeSync(retries_left, opts)
     end
 end
 
-function WebDAVSync:getSetting(key, default)
-    if not G_reader_settings then return default end
-    if not G_reader_settings:has("webdav_autosync_" .. key) then return default end
-    return G_reader_settings:readSetting("webdav_autosync_" .. key)
-end
-
-function WebDAVSync:saveSetting(key, value)
-    if G_reader_settings then
-        G_reader_settings:saveSetting("webdav_autosync_" .. key, value)
-    end
-end
-
 function WebDAVSync:setWebDAVServer()
     local text_info = _("Server address must be of the form http(s)://domain.name/path\n(e.g. https://example.com/webdav).\nUsername and password are optional.")
-    local addr = self:getSetting("server_url", "")
-    local user = self:getSetting("username", "")
-    local pass = self:getSetting("password", "")
+    local addr = settings.get("server_url", "")
+    local user = settings.get("username", "")
+    local pass = settings.get("password", "")
     if type(addr) ~= "string" then addr = "" end
     if type(user) ~= "string" then user = "" end
     if type(pass) ~= "string" then pass = "" end
     local dref = {}
-    local plugin = self
     local ok, err = pcall(function()
         dref[1] = MultiInputDialog:new{
             title = _("WebDAV server"),
@@ -949,9 +847,9 @@ function WebDAVSync:setWebDAVServer()
                             })
                             return
                         end
-                        if a ~= "" then plugin:saveSetting("server_url", a) end
-                        plugin:saveSetting("username", u)
-                        plugin:saveSetting("password", p)
+                        if a ~= "" then settings.save("server_url", a) end
+                        settings.save("username", u)
+                        settings.save("password", p)
                         UIManager:close(d)
                     end, },
                 },
@@ -1017,9 +915,9 @@ function WebDAVSync:applyCloudStorageEntry(server)
         if not start:match("^/") then start = "/" .. start end
         server_url = server_url .. start
     end
-    self:saveSetting("server_url", server_url)
-    self:saveSetting("username", server.username or "")
-    self:saveSetting("password", server.password or "")
+    settings.save("server_url", server_url)
+    settings.save("username", server.username or "")
+    settings.save("password", server.password or "")
 
     local label = (server.name and server.name ~= "") and server.name or (server.address or "")
     UIManager:show(InfoMessage:new{
@@ -1028,10 +926,9 @@ function WebDAVSync:applyCloudStorageEntry(server)
 end
 
 function WebDAVSync:setDownloadFolder()
-    local current = self:getSetting("download_folder", "")
+    local current = settings.get("download_folder", "")
     if type(current) ~= "string" then current = nil end
     if current == "" then current = nil end
-    local plugin = self
     -- Prefer home directory when no folder is set (not /mnt or data dir)
     local initial_dir = current
     if not initial_dir or initial_dir == "" then
@@ -1054,7 +951,7 @@ function WebDAVSync:setDownloadFolder()
         path = initial_dir,
         onConfirm = function(dir_path)
             if dir_path and dir_path ~= "" then
-                plugin:saveSetting("download_folder", dir_path)
+                settings.save("download_folder", dir_path)
             end
             UIManager:close(path_chooser)
         end,
@@ -1066,12 +963,12 @@ function WebDAVSync:setCooldown()
     UIManager:show(SpinWidget:new{
         title_text = _("Auto sync cooldown (seconds)"),
         info_text = _("Minimum seconds between auto-triggered full reconciles (device wake, KOReader startup). Manual syncs always run regardless. The book-close trigger has its own cooldown. Set to 0 to disable."),
-        value = get_cooldown(),
-        value_min = COOLDOWN_MIN,
-        value_max = COOLDOWN_MAX,
-        value_step = COOLDOWN_STEP,
-        value_hold_step = COOLDOWN_STEP * 2,
-        default_value = DEFAULT_COOLDOWN,
+        value = settings.get_cooldown(),
+        value_min = settings.COOLDOWN_MIN,
+        value_max = settings.COOLDOWN_MAX,
+        value_step = settings.COOLDOWN_STEP,
+        value_hold_step = settings.COOLDOWN_STEP * 2,
+        default_value = settings.DEFAULT_COOLDOWN,
         ok_text = _("Set"),
         callback = function(spin)
             G_reader_settings:saveSetting("webdav_autosync_cooldown_seconds", spin.value)
@@ -1083,12 +980,12 @@ function WebDAVSync:setCloseCooldown()
     UIManager:show(SpinWidget:new{
         title_text = _("Close-trigger cooldown (seconds)"),
         info_text = _("Minimum seconds between two consecutive close-trigger syncs of the same book. Closing a different book always runs regardless. Set to 0 to disable."),
-        value = get_close_cooldown(),
-        value_min = CLOSE_COOLDOWN_MIN,
-        value_max = CLOSE_COOLDOWN_MAX,
-        value_step = CLOSE_COOLDOWN_STEP,
-        value_hold_step = CLOSE_COOLDOWN_STEP * 3,
-        default_value = DEFAULT_CLOSE_COOLDOWN,
+        value = settings.get_close_cooldown(),
+        value_min = settings.CLOSE_COOLDOWN_MIN,
+        value_max = settings.CLOSE_COOLDOWN_MAX,
+        value_step = settings.CLOSE_COOLDOWN_STEP,
+        value_hold_step = settings.CLOSE_COOLDOWN_STEP * 3,
+        default_value = settings.DEFAULT_CLOSE_COOLDOWN,
         ok_text = _("Set"),
         callback = function(spin)
             G_reader_settings:saveSetting("webdav_autosync_close_cooldown_seconds", spin.value)
@@ -1100,12 +997,12 @@ function WebDAVSync:setResumeSettle()
     UIManager:show(SpinWidget:new{
         title_text = _("Wake settle delay (seconds)"),
         info_text = _("How long to wait after the device wakes before starting an auto-sync. Filters brief system wakes (RTC alarms, hall-sensor twitches, framework background tasks) that don't represent the user actually picking up the device. 0 disables the gate (sync runs immediately on wake)."),
-        value = get_resume_settle(),
-        value_min = RESUME_SETTLE_MIN,
-        value_max = RESUME_SETTLE_MAX,
-        value_step = RESUME_SETTLE_STEP,
-        value_hold_step = RESUME_SETTLE_STEP * 2,
-        default_value = DEFAULT_RESUME_SETTLE,
+        value = settings.get_resume_settle(),
+        value_min = settings.RESUME_SETTLE_MIN,
+        value_max = settings.RESUME_SETTLE_MAX,
+        value_step = settings.RESUME_SETTLE_STEP,
+        value_hold_step = settings.RESUME_SETTLE_STEP * 2,
+        default_value = settings.DEFAULT_RESUME_SETTLE,
         ok_text = _("Set"),
         callback = function(spin)
             G_reader_settings:saveSetting("webdav_autosync_resume_settle_seconds", spin.value)
@@ -1120,10 +1017,9 @@ function WebDAVSync:setResumeSettle()
 end
 
 function WebDAVSync:setFileExtensions()
-    local current = self:getSetting("file_extensions", "")
+    local current = settings.get("file_extensions", "")
     if type(current) ~= "string" then current = "" end
     local dref = {}
-    local plugin = self
     dref[1] = MultiInputDialog:new{
         title = _("File extensions to sync"),
         fields = {
@@ -1148,7 +1044,7 @@ function WebDAVSync:setFileExtensions()
                         local d = dref[1]
                         if not d then return end
                         local fields = d:getFields()
-                        plugin:saveSetting("file_extensions", (fields and fields[1]) or "")
+                        settings.save("file_extensions", (fields and fields[1]) or "")
                         UIManager:close(d)
                     end,
                 },
@@ -1198,16 +1094,16 @@ function WebDAVSync:doSync(opts)
         return
     end
 
-    local server_url = self:getSetting("server_url", "")
+    local server_url = settings.get("server_url", "")
     if type(server_url) == "string" then
         server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
     else
         server_url = ""
     end
-    local username = self:getSetting("username", "")
-    local password = self:getSetting("password", "")
-    local folder = self:getSetting("download_folder", "")
-    local file_extensions = self:getSetting("file_extensions", "")
+    local username = settings.get("username", "")
+    local password = settings.get("password", "")
+    local folder = settings.get("download_folder", "")
+    local file_extensions = settings.get("file_extensions", "")
     if not folder or folder == "" then
         UIManager:show(ConfirmBox:new{
             text = _("Download folder not set. Choose folder now?"),
@@ -1675,8 +1571,8 @@ function WebDAVSync:doProgressSync(opts)
 
     -- Cheap config check first: skip remaining work entirely (incl. the
     -- network probe below) on installs that aren't configured yet.
-    local server_url = self:getSetting("server_url", "")
-    local local_folder = self:getSetting("download_folder", "")
+    local server_url = settings.get("server_url", "")
+    local local_folder = settings.get("download_folder", "")
     if type(server_url) ~= "string" then server_url = "" end
     if type(local_folder) ~= "string" then local_folder = "" end
     server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
@@ -1773,8 +1669,8 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
         return
     end
 
-    local server_url = self:getSetting("server_url", "")
-    local local_folder = self:getSetting("download_folder", "")
+    local server_url = settings.get("server_url", "")
+    local local_folder = settings.get("download_folder", "")
     if type(server_url) ~= "string" then server_url = "" end
     if type(local_folder) ~= "string" then local_folder = "" end
     server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
@@ -1793,8 +1689,8 @@ function WebDAVSync:doProgressSyncForBook(book_rel)
     -- network, so claim the in-flight lock. Released on every exit below.
     acquire_sync_lock()
 
-    local username = self:getSetting("username", "")
-    local password = self:getSetting("password", "")
+    local username = settings.get("username", "")
+    local password = settings.get("password", "")
     logger.info("webdav_autosync: close-trigger sync start book=" .. tostring(book_rel))
     local plan_obj, err = sync.plan_progress_book(server_url, username, password, local_folder, book_rel)
     if not plan_obj then
@@ -1861,8 +1757,8 @@ function WebDAVSync:runProgressSync(opts)
     local function done() if on_done then on_done() end end
 
     acquire_sync_lock()
-    local username = self:getSetting("username", "")
-    local password = self:getSetting("password", "")
+    local username = settings.get("username", "")
+    local password = settings.get("password", "")
 
     local syncing_msg
     if not silent_mode then
