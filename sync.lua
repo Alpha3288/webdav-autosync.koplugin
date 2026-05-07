@@ -357,10 +357,12 @@ local function run_sync(server_url, username, password, local_folder, progress_c
     for _, e in ipairs(list) do
         if not e.is_collection then
             local rel = rel_from_remote_path(e.path or "", base)
-            if rel_is_safe(rel) and extension_allowed(e.path or "", extensions_set) then
-                table.insert(files, e)
-            elseif not rel_is_safe(rel) then
-                logger.dbg("webdav_autosync: run_sync drop unsafe remote rel=" .. rel)
+            if rel ~= "" then
+                if not rel_is_safe(rel) then
+                    logger.dbg("webdav_autosync: run_sync drop unsafe remote rel=" .. rel)
+                elseif extension_allowed(e.path or "", extensions_set) then
+                    table.insert(files, e)
+                end
             end
         end
     end
