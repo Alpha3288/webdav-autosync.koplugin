@@ -466,6 +466,7 @@ local function upload_file(remote_url, local_path, username, password)
 
     local url = url_encode(normalize_url(remote_url))
     local response_body = {}
+    logger.dbg("webdav_autosync: PUT prepare url=" .. url .. " size=" .. tostring(size))
     local code, headers = do_request("PUT", {
         url = url,
         method = "PUT",
