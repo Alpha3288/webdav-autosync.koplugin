@@ -304,6 +304,7 @@ function WebDAVSync:doSync(opts)
         return
     end
 
+    local open_document_path = (self.ui and self.ui.document and self.ui.document.file) or nil
     local two_way = G_reader_settings and G_reader_settings:isTrue("webdav_autosync_books_two_way")
     local ctx = {
         server_url = server_url,
@@ -331,6 +332,7 @@ function WebDAVSync:doSync(opts)
                 summary_prefix = _("Sync done."),
                 plan_failure_label = _("book sync"),
                 plan_failure_prefix = _("Sync failed: %1"),
+                open_document_path = open_document_path,
                 on_done = on_done,
                 log_done = function(stats)
                     logger.info(string.format(
@@ -401,6 +403,7 @@ function WebDAVSync:doProgressSync(opts)
         return done()
     end
 
+    local open_document_path = (self.ui and self.ui.document and self.ui.document.file) or nil
     local NetworkMgr = require("ui/network/manager")
     local function dispatch()
         local username = settings.get("username", "")
@@ -423,6 +426,7 @@ function WebDAVSync:doProgressSync(opts)
                 summary_prefix = _("Reading progress synced."),
                 plan_failure_label = _("progress sync"),
                 plan_failure_prefix = _("Progress sync failed: %1"),
+                open_document_path = open_document_path,
                 on_done = on_done,
                 log_done = function(stats)
                     logger.info(string.format(

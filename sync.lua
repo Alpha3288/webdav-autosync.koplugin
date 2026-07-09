@@ -51,11 +51,11 @@ end
 --- `plan_progress_book`) so multiple chained syncs can be distinguished.
 local function log_plan_summary(name, remote_index, local_index, actions)
     logger.dbg(string.format(
-        "webdav_autosync: %s done remote=%d local=%d download=%d upload=%d conflicts=%d baselined=%d unchanged=%d remote_gone=%d local_gone=%d",
+        "webdav_autosync: %s done remote=%d local=%d download=%d upload=%d conflicts=%d deletions=%d baselined=%d unchanged=%d remote_gone=%d local_gone=%d",
         name,
         count_keys(remote_index), count_keys(local_index),
         #actions.to_download, #actions.to_upload, #actions.conflicts,
-        actions.baselined, actions.skipped_unchanged,
+        #actions.deletions, actions.baselined, actions.skipped_unchanged,
         actions.skipped_remote_gone, actions.skipped_local_gone))
 end
 
@@ -408,11 +408,23 @@ end
 --- only differ in which files they include in the indices. Returns the
 --- actions table plus a flag indicating whether silent baselining touched
 --- the cache (so the caller can flush).
-local function diff_indices(remote_index, local_index, cache_files, server_url, local_folder)
+---
+--- `opts.collect_deletions` (default false → legacy behavior) turns the two
+--- tombstone branches — a cache row whose file has vanished on exactly one
+--- side — into user-confirmable deletion-propagation entries in
+--- `actions.deletions` instead of merely bumping the skip counters. A
+--- per-direction safety guard suppresses collection when a whole side's index
+--- came back empty while the cache is non-empty (the unmounted-storage /
+--- server-wiped case, where every cached file looks deleted); those fall back
+--- to the skip counter and log a warning. The two guards are independent.
+local function diff_indices(remote_index, local_index, cache_files, server_url, local_folder, opts)
+    opts = opts or {}
+    local collect_deletions = opts.collect_deletions == true
     local actions = {
         to_download = {},
         to_upload = {},
         conflicts = {},
+        deletions = {},
         skipped_unchanged = 0,
         skipped_remote_gone = 0,
         skipped_local_gone = 0,
@@ -425,6 +437,27 @@ local function diff_indices(remote_index, local_index, cache_files, server_url, 
     for rel in pairs(local_index) do seen[rel] = true end
     for rel in pairs(cache_files) do seen[rel] = true end
 
+    -- Per-direction deletion-collection guards. If the local index is empty
+    -- while the cache holds ≥1 row, every cached file looks locally-deleted —
+    -- almost always unmounted storage rather than a genuine mass delete — so
+    -- suppress local_gone collection for this run. Symmetric for the remote
+    -- side (server unreachable / wiped). Guards are independent.
+    local cache_count = count_keys(cache_files)
+    local collect_local_gone = collect_deletions
+    local collect_remote_gone = collect_deletions
+    if collect_deletions and cache_count > 0 then
+        if next(local_index) == nil then
+            collect_local_gone = false
+            logger.warn(string.format(
+                "webdav_autosync: deletion guard tripped side=local cache=%d index=0", cache_count))
+        end
+        if next(remote_index) == nil then
+            collect_remote_gone = false
+            logger.warn(string.format(
+                "webdav_autosync: deletion guard tripped side=remote cache=%d index=0", cache_count))
+        end
+    end
+
     local cache_dirty = false
 
     for rel in pairs(seen) do
@@ -435,9 +468,22 @@ local function diff_indices(remote_index, local_index, cache_files, server_url, 
 
         if r and not l then
             if c then
-                -- File was synced before and is now gone locally. No-deletion
-                -- policy: don't re-download. Keep cache entry so we keep skipping.
-                actions.skipped_local_gone = actions.skipped_local_gone + 1
+                if collect_local_gone then
+                    -- File deleted on device but present + cached on server.
+                    -- Surface for confirmation: Delete = DELETE on server,
+                    -- Restore = re-download.
+                    logger.dbg("webdav_autosync: diff rel=" .. rel .. " decision=deletion kind=local_gone")
+                    table.insert(actions.deletions, {
+                        rel = rel,
+                        kind = "local_gone",
+                        remote_url = r.href,
+                        local_path = local_path,
+                        remote = r,
+                    })
+                else
+                    -- Legacy / guard-tripped: keep skipping, keep cache row.
+                    actions.skipped_local_gone = actions.skipped_local_gone + 1
+                end
             else
                 table.insert(actions.to_download, {
                     rel = rel,
@@ -448,8 +494,22 @@ local function diff_indices(remote_index, local_index, cache_files, server_url, 
             end
         elseif l and not r then
             if c then
-                -- File existed remotely, now gone. No-deletion: don't re-upload.
-                actions.skipped_remote_gone = actions.skipped_remote_gone + 1
+                if collect_remote_gone then
+                    -- File deleted on server but present + cached locally.
+                    -- Surface for confirmation: Delete = remove local file,
+                    -- Restore = re-upload.
+                    logger.dbg("webdav_autosync: diff rel=" .. rel .. " decision=deletion kind=remote_gone")
+                    table.insert(actions.deletions, {
+                        rel = rel,
+                        kind = "remote_gone",
+                        local_path = l.path,
+                        remote_url = build_remote_url(server_url, rel),
+                        ["local"] = l,
+                    })
+                else
+                    -- Legacy / guard-tripped: keep skipping, keep cache row.
+                    actions.skipped_remote_gone = actions.skipped_remote_gone + 1
+                end
             else
                 local remote_url = build_remote_url(server_url, rel)
                 table.insert(actions.to_upload, {
@@ -581,7 +641,7 @@ local function plan(server_url, username, password, local_folder, extensions_fil
     local cache_files = load_cache_files(cache)
 
     local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
-            server_url, local_folder)
+            server_url, local_folder, { collect_deletions = true })
     log_plan_summary("plan", remote_index, local_index, actions)
 
     if cache_dirty then
@@ -719,7 +779,7 @@ local function plan_progress(server_url, username, password, local_folder)
     local local_index = walk_local_sidecars(local_folder, cache_files)
 
     local actions, cache_dirty = diff_indices(remote_index, local_index, cache_files,
-            server_url, local_folder)
+            server_url, local_folder, { collect_deletions = true })
     log_plan_summary("plan_progress", remote_index, local_index, actions)
 
     if cache_dirty then
@@ -738,11 +798,62 @@ local function plan_progress(server_url, username, password, local_folder)
     }
 end
 
---- Execute one planned action. `kind` is "download" or "upload". Updates
---- the in-memory cache; caller flushes via save_cache when done with a batch.
---- Returns true on success, or nil, error_message.
+--- After removing a local file, walk upward from its directory toward the
+--- download-folder root calling rmdir while it succeeds. rmdir refuses
+--- non-empty directories, so this is inherently safe — a directory that
+--- still holds other files simply won't be removed and the walk stops.
+--- Never ascends above `local_folder`. Best-effort: any failure (including
+--- the expected "directory not empty") just ends the walk; dbg-logged.
+local function prune_empty_local_dirs(local_folder, file_path)
+    local lfs = load_lfs()
+    local root = local_folder:gsub("/+$", "")
+    local dir = file_path:match("^(.+)/[^/]+$")
+    while dir and #dir > #root and dir:sub(1, #root + 1) == root .. "/" do
+        local ok = lfs.rmdir(dir)
+        if not ok then
+            logger.dbg("webdav_autosync: prune_empty_local_dirs stop dir=" .. dir .. " reason=rmdir-refused")
+            return
+        end
+        logger.dbg("webdav_autosync: prune_empty_local_dirs removed dir=" .. dir)
+        dir = dir:match("^(.+)/[^/]+$")
+    end
+end
+
+--- Execute one planned action. `kind` is one of "download", "upload",
+--- "delete_remote", "delete_local". Updates the in-memory cache; caller
+--- flushes via save_cache when done with a batch. Returns true on success,
+--- or nil, error_message.
 local function do_action(p, kind, action)
-    if kind == "download" then
+    if kind == "delete_remote" then
+        -- Deletion confirmed for a file gone locally: remove it on the server.
+        logger.dbg("webdav_autosync: action=delete_remote rel=" .. action.rel)
+        local ok, msg = webdav.delete(action.remote_url, p.username, p.password)
+        if not ok then
+            logger.dbg("webdav_autosync: action=delete_remote rel=" .. action.rel .. " result=fail msg=" .. tostring(msg))
+            return nil, msg
+        end
+        -- File now absent on both sides: drop the cache row (a future re-add
+        -- is a fresh file). Best-effort prune of now-empty parent collections.
+        p.cache_files[action.rel] = nil
+        local dir_rel = action.rel:match("^(.+)/[^/]+$")
+        if dir_rel then
+            webdav.prune_empty_remote_dirs(p.server_url, dir_rel, p.username, p.password)
+        end
+        logger.dbg("webdav_autosync: action=delete_remote rel=" .. action.rel .. " result=ok")
+        return true
+    elseif kind == "delete_local" then
+        -- Deletion confirmed for a file gone on the server: remove it locally.
+        logger.dbg("webdav_autosync: action=delete_local rel=" .. action.rel)
+        local ok, msg = os.remove(action.local_path)
+        if not ok then
+            logger.dbg("webdav_autosync: action=delete_local rel=" .. action.rel .. " result=fail msg=" .. tostring(msg))
+            return nil, msg
+        end
+        p.cache_files[action.rel] = nil
+        prune_empty_local_dirs(p.local_folder, action.local_path)
+        logger.dbg("webdav_autosync: action=delete_local rel=" .. action.rel .. " result=ok")
+        return true
+    elseif kind == "download" then
         logger.dbg("webdav_autosync: action=download rel=" .. action.rel)
         local ok, msg = webdav.download_file(action.remote_url, action.local_path, p.username, p.password)
         if not ok then

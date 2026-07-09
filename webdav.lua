@@ -487,6 +487,76 @@ local function upload_file(remote_url, local_path, username, password)
     return true, etag
 end
 
+--- DELETE a WebDAV resource (file or collection). Accepts a DECODED url and
+--- encodes internally like download_file / upload_file / mkcol / get_props do.
+--- Success = 2xx (200 OK / 202 Accepted / 204 No Content), AND 404 Not Found
+--- is treated as success — the resource is already gone, so the delete is
+--- idempotent. Returns true on success, or nil, error_message otherwise.
+--- NOTE: WebDAV DELETE on a collection is recursive; callers that delete a
+--- collection must first confirm it is genuinely empty (see
+--- prune_empty_remote_dirs).
+local function delete(remote_url, username, password)
+    local url = url_encode(normalize_url(remote_url))
+    local body = {}
+    local code = do_request("DELETE", {
+        url = url,
+        method = "DELETE",
+        sink = ltn12.sink.table(body),
+        user = (username and username ~= "") and username or nil,
+        password = (password and password ~= "") and password or nil,
+    })
+    if type(code) == "number" and ((code >= 200 and code < 300) or code == 404) then
+        return true
+    end
+    return nil, "HTTP " .. tostring(code)
+end
+
+--- Best-effort cleanup of empty parent collections after a remote file was
+--- deleted. Walks upward from `dir_rel` (the deleted file's parent directory,
+--- as a relpath under the server base) toward the base, and for each level
+--- does a FRESH Depth: 1 PROPFIND: only if the collection contains nothing
+--- but its own self entry is it DELETEd, then we continue to its parent.
+--- The fresh PROPFIND is MANDATORY — planner indices are extension-filtered,
+--- and WebDAV DELETE on a collection is recursive, so deleting a directory
+--- that merely looked empty in the index could destroy unsynced files.
+--- Stops at the first non-empty parent, the server base, or any error.
+--- Failures log at dbg and are never surfaced as sync failures.
+local function prune_empty_remote_dirs(server_url, dir_rel, username, password)
+    local base = normalize_url(server_url):gsub("/+$", "")
+    local rel = (dir_rel or ""):gsub("^/+", ""):gsub("/+$", "")
+    while rel ~= "" do
+        local dir_url = base .. "/" .. rel
+        -- list_one wants an already-encoded URL (see encoding contract).
+        local list = list_one(url_encode(dir_url), username, password, "1")
+        if not list then
+            logger.dbg("webdav_autosync: prune_empty_remote_dirs stop rel=" .. rel .. " reason=propfind-failed")
+            return
+        end
+        -- Derive the self path the same way the recursion self-skip does so a
+        -- collection with only its own entry counts as empty.
+        local self_path = dir_url:gsub("^https?://[^/]+", ""):gsub("^/+", ""):gsub("/+$", "")
+        self_path = self_path:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
+        local child_count = 0
+        for _, e in ipairs(list) do
+            local e_path_norm = (e.path or ""):gsub("^/+", ""):gsub("/+$", "")
+            if e_path_norm ~= self_path and e_path_norm ~= "" then
+                child_count = child_count + 1
+            end
+        end
+        if child_count > 0 then
+            logger.dbg("webdav_autosync: prune_empty_remote_dirs stop rel=" .. rel .. " reason=non-empty children=" .. tostring(child_count))
+            return
+        end
+        local ok, err = delete(dir_url, username, password)
+        if not ok then
+            logger.dbg("webdav_autosync: prune_empty_remote_dirs stop rel=" .. rel .. " reason=delete-failed err=" .. tostring(err))
+            return
+        end
+        logger.dbg("webdav_autosync: prune_empty_remote_dirs removed rel=" .. rel)
+        rel = rel:match("^(.+)/[^/]+$") or ""
+    end
+end
+
 return {
     normalize_url = normalize_url,
     url_has_host = url_has_host,
@@ -498,5 +568,7 @@ return {
     mkcol = mkcol,
     ensure_remote_dirs = ensure_remote_dirs,
     get_props = get_props,
+    delete = delete,
+    prune_empty_remote_dirs = prune_empty_remote_dirs,
     parse_http_date = parse_http_date,
 }

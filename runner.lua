@@ -40,6 +40,10 @@ local function init_stats_from_plan(plan_obj)
         unchanged = plan_obj.actions.skipped_unchanged,
         baselined = plan_obj.actions.baselined,
         conflicts_skipped = 0,
+        deleted_remote = 0,
+        deleted_local = 0,
+        restored = 0,
+        deferred_deletions = 0,
         failed = 0,
         failures = {},
         downloaded_rels = {},
@@ -90,6 +94,10 @@ local function merge_chain_stats(chain_stats, stats, section)
         unchanged = stats.unchanged or 0,
         baselined = stats.baselined or 0,
         conflicts_skipped = stats.conflicts_skipped or 0,
+        deleted_remote = stats.deleted_remote or 0,
+        deleted_local = stats.deleted_local or 0,
+        restored = stats.restored or 0,
+        deferred_deletions = stats.deferred_deletions or 0,
         failed = stats.failed,
         failures = stats.failures or {},
     }
@@ -126,6 +134,18 @@ local function describe_chain_section(section)
     end
     if section.conflicts_skipped > 0 then
         table.insert(parts, T(_("%1 conflicts skipped"), tostring(section.conflicts_skipped)))
+    end
+    if (section.deleted_remote or 0) > 0 then
+        table.insert(parts, T(_("%1 deleted on server"), tostring(section.deleted_remote)))
+    end
+    if (section.deleted_local or 0) > 0 then
+        table.insert(parts, T(_("%1 deleted locally"), tostring(section.deleted_local)))
+    end
+    if (section.restored or 0) > 0 then
+        table.insert(parts, T(_("%1 restored"), tostring(section.restored)))
+    end
+    if (section.deferred_deletions or 0) > 0 then
+        table.insert(parts, T(_("%1 deletions deferred"), tostring(section.deferred_deletions)))
     end
     if section.failed > 0 then
         table.insert(parts, T(_("%1 failed"), tostring(section.failed)))
@@ -174,6 +194,18 @@ local function show_summary(prefix, stats)
     if stats.conflicts_skipped > 0 then
         table.insert(parts, T(_("%1 conflicts skipped."), tostring(stats.conflicts_skipped)))
     end
+    if (stats.deleted_remote or 0) > 0 then
+        table.insert(parts, T(_("%1 deleted on server."), tostring(stats.deleted_remote)))
+    end
+    if (stats.deleted_local or 0) > 0 then
+        table.insert(parts, T(_("%1 deleted locally."), tostring(stats.deleted_local)))
+    end
+    if (stats.restored or 0) > 0 then
+        table.insert(parts, T(_("%1 restored."), tostring(stats.restored)))
+    end
+    if (stats.deferred_deletions or 0) > 0 then
+        table.insert(parts, T(_("%1 deletions deferred."), tostring(stats.deferred_deletions)))
+    end
     if stats.failed > 0 then
         table.insert(parts, T(_("%1 failed."), tostring(stats.failed)))
     end
@@ -211,18 +243,244 @@ local function notify_library_refresh(local_folder, downloaded_rels)
     UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
 end
 
+-- ---------- deletion dialog chain ----------
+
+-- Map a deletion entry + user choice onto a sync.do_action call. For each
+-- entry `kind`:
+--   local_gone  (file vanished on device, still on server)
+--     Delete  -> delete_remote (propagate the delete to the server)
+--     Restore -> download      (bring the file back to the device)
+--   remote_gone (file vanished on server, still on device)
+--     Delete  -> delete_local  (remove the local file)
+--     Restore -> upload        (push the file back to the server)
+local function deletion_action_kind(entry, choice)
+    if entry.kind == "local_gone" then
+        return choice == "delete" and "delete_remote" or "download"
+    end
+    -- remote_gone
+    return choice == "delete" and "delete_local" or "upload"
+end
+
+-- Bump the right stats counter after a successful delete/restore.
+local function record_deletion_result(stats, entry, choice)
+    if choice == "restore" then
+        stats.restored = stats.restored + 1
+        if entry.kind == "local_gone" and stats.downloaded_rels then
+            table.insert(stats.downloaded_rels, entry.rel)
+        end
+    elseif entry.kind == "local_gone" then
+        stats.deleted_remote = stats.deleted_remote + 1
+    else
+        stats.deleted_local = stats.deleted_local + 1
+    end
+end
+
+-- Translate the plugin's open-document absolute path into a rel under the
+-- download folder, or nil when there is no open document / it lives outside
+-- the folder. Used to protect the open book (and its `<book>.sdr/`) from
+-- deletion propagation.
+local function open_document_rel(local_folder, open_document_path)
+    if type(open_document_path) ~= "string" or open_document_path == "" then return nil end
+    if type(local_folder) ~= "string" or local_folder == "" then return nil end
+    local root = local_folder:gsub("/+$", "")
+    if open_document_path:sub(1, #root + 1) ~= root .. "/" then return nil end
+    local rel = open_document_path:sub(#root + 2)
+    if rel == "" then return nil end
+    return rel
+end
+
+-- True when a deletion entry's rel belongs to the open book — either the book
+-- file itself or any file under its `<book>.sdr/` sidecar directory.
+local function deletion_touches_open_book(rel, book_rel)
+    if not book_rel then return false end
+    if rel == book_rel then return true end
+    local stem = book_rel:gsub("%.[^/.]+$", "")
+    local sdr_prefix = stem .. ".sdr/"
+    return rel:sub(1, #sdr_prefix) == sdr_prefix
+end
+
+-- Filter out deletions that touch the currently open document. Filtered
+-- entries simply re-surface on the next sync. Returns the kept list.
+local function filter_open_document_deletions(deletions, local_folder, open_document_path)
+    local book_rel = open_document_rel(local_folder, open_document_path)
+    if not book_rel then return deletions end
+    local kept = {}
+    for _, d in ipairs(deletions) do
+        if deletion_touches_open_book(d.rel, book_rel) then
+            logger.dbg("webdav_autosync: deletion skip reason=document-open rel=" .. d.rel)
+        else
+            table.insert(kept, d)
+        end
+    end
+    return kept
+end
+
+-- Build the batch-dialog title: entries grouped by direction, up to ~8
+-- relpaths listed per group then "…and K more".
+local function describe_deletion_group(header, entries)
+    local MAX_LISTED = 8
+    local lines = { T(_("%1 (%2):"), header, tostring(#entries)) }
+    for i = 1, math.min(#entries, MAX_LISTED) do
+        table.insert(lines, "  " .. entries[i].rel)
+    end
+    if #entries > MAX_LISTED then
+        table.insert(lines, T(_("…and %1 more"), tostring(#entries - MAX_LISTED)))
+    end
+    return table.concat(lines, "\n")
+end
+
+local function build_deletions_title(deletions)
+    local local_gone, remote_gone = {}, {}
+    for _, d in ipairs(deletions) do
+        if d.kind == "local_gone" then
+            table.insert(local_gone, d)
+        else
+            table.insert(remote_gone, d)
+        end
+    end
+    local sections = {}
+    if #local_gone > 0 then
+        table.insert(sections, describe_deletion_group(_("Deleted on device"), local_gone))
+    end
+    if #remote_gone > 0 then
+        table.insert(sections, describe_deletion_group(_("Deleted on server"), remote_gone))
+    end
+    return _("Files deleted since last sync.") .. "\n\n" .. table.concat(sections, "\n\n")
+end
+
+-- Apply one choice ("delete" | "restore") to one deletion entry, updating
+-- stats. Returns nothing; failures append to stats.failures.
+local function apply_deletion(plan_obj, entry, choice, stats)
+    local action_kind = deletion_action_kind(entry, choice)
+    logger.dbg("webdav_autosync: deletion apply rel=" .. entry.rel
+        .. " kind=" .. entry.kind .. " choice=" .. choice .. " action=" .. action_kind)
+    local ok, msg = sync.do_action(plan_obj, action_kind, entry)
+    if ok then
+        record_deletion_result(stats, entry, choice)
+    else
+        stats.failed = stats.failed + 1
+        table.insert(stats.failures, entry.rel .. " (" .. tostring(msg) .. ")")
+        logger.warn("webdav_autosync: deletion " .. choice .. " failed rel=" .. entry.rel
+            .. " err=" .. tostring(msg))
+    end
+end
+
+-- Per-file review chain: one ButtonDialogTitle per deletion offering
+-- Delete / Restore / Later. Calls on_done when the list is exhausted.
+--
+-- Dismissing a dialog (outside tap / Back key) counts as Later for the
+-- current entry. ButtonDialog defaults dismissable=true and its onClose
+-- only runs tap_close_callback and closes the widget — without routing
+-- dismissal into the chain, on_done would never fire and the sync lock
+-- would stay held. The `handled` flag makes "continuation runs exactly
+-- once per dialog" an explicit invariant; button callbacks close the
+-- dialog themselves (UIManager:close only dispatches CloseWidget, it does
+-- NOT re-trigger tap_close_callback), while the dismiss path leaves the
+-- closing to onClose.
+local function review_deletions_each(plan_obj, deletions, stats, on_done)
+    local idx = 1
+    local function next_one()
+        if idx > #deletions then on_done() return end
+        local entry = deletions[idx]
+        local dialog
+        local handled = false
+        local function pick(choice, dismissed)
+            if handled then return end
+            handled = true
+            if not dismissed then UIManager:close(dialog) end
+            idx = idx + 1
+            if choice == "later" then
+                stats.deferred_deletions = stats.deferred_deletions + 1
+                logger.dbg("webdav_autosync: deletion review rel=" .. entry.rel
+                    .. " choice=later" .. (dismissed and " reason=dismissed" or ""))
+            else
+                apply_deletion(plan_obj, entry, choice, stats)
+            end
+            next_one()
+        end
+        local header = entry.kind == "local_gone"
+            and _("Deleted on device — propagate to server?")
+            or _("Deleted on server — apply locally?")
+        dialog = ButtonDialogTitle:new{
+            title = header .. "\n" .. entry.rel,
+            buttons = {
+                {{ text = _("Delete"),  callback = function() pick("delete")  end }},
+                {{ text = _("Restore"), callback = function() pick("restore") end }},
+                {{ text = _("Later"),   callback = function() pick("later")   end }},
+            },
+            tap_close_callback = function() pick("later", true) end,
+        }
+        UIManager:show(dialog)
+    end
+    next_one()
+end
+
+-- Batch deletion dialog. Surfaces one ButtonDialogTitle summarizing every
+-- detected deletion, with Delete all / Restore all / Review each / Later.
+-- Runs BEFORE conflict resolution; always surfaces (not gated by
+-- silent_mode). Every exit path — including Later and dismissal (outside
+-- tap / Back key, which routes to the Later path via tap_close_callback) —
+-- calls on_done so the auto-chain orchestrator never stalls. The `handled`
+-- flag guarantees the continuation runs exactly once; see
+-- review_deletions_each for the dismissal/close mechanics.
+local function resolve_deletions_interactive(plan_obj, deletions, stats, on_done)
+    local dialog
+    local handled = false
+    local function choose(choice, dismissed)
+        if handled then return end
+        handled = true
+        if not dismissed then UIManager:close(dialog) end
+        if choice == "delete" or choice == "restore" then
+            logger.info("webdav_autosync: deletion resolve choice="
+                .. (choice == "delete" and "delete_all" or "restore_all"))
+            for _, entry in ipairs(deletions) do
+                apply_deletion(plan_obj, entry, choice, stats)
+            end
+            on_done()
+        elseif choice == "review" then
+            logger.info("webdav_autosync: deletion resolve choice=review")
+            review_deletions_each(plan_obj, deletions, stats, on_done)
+        else -- later (button or dismissal)
+            logger.info("webdav_autosync: deletion resolve choice=later"
+                .. (dismissed and " reason=dismissed" or ""))
+            stats.deferred_deletions = stats.deferred_deletions + #deletions
+            on_done()
+        end
+    end
+    dialog = ButtonDialogTitle:new{
+        title = build_deletions_title(deletions),
+        buttons = {
+            {{ text = _("Delete all"),  callback = function() choose("delete")  end }},
+            {{ text = _("Restore all"), callback = function() choose("restore") end }},
+            {{ text = _("Review each"), callback = function() choose("review")  end }},
+            {{ text = _("Later"),       callback = function() choose("later")   end }},
+        },
+        tap_close_callback = function() choose("later", true) end,
+    }
+    UIManager:show(dialog)
+end
+
 -- ---------- conflict dialog chain ----------
 
+-- Dismissing a conflict dialog (outside tap / Back key) counts as Skip for
+-- the current conflict — same contract as the deletion dialogs: every exit
+-- path must continue the chain or a stray tap would leave the sync lock
+-- held and stall a chained sync. See review_deletions_each for the
+-- dismissal/close mechanics (handled flag, who closes the widget).
 local function resolve_conflicts_interactive(plan_obj, conflicts, stats, on_done)
     local idx = 1
     local function next_one()
         if idx > #conflicts then on_done() return end
         local c = conflicts[idx]
         local dialog
-        local function pick(action)
-            UIManager:close(dialog)
+        local handled = false
+        local function pick(action, dismissed)
+            if handled then return end
+            handled = true
+            if not dismissed then UIManager:close(dialog) end
             idx = idx + 1
-            logger.dbg("webdav_autosync: conflict resolution rel=" .. c.rel .. " choice=" .. action)
+            logger.dbg("webdav_autosync: conflict resolution rel=" .. c.rel .. " choice=" .. action
+                .. (dismissed and " reason=dismissed" or ""))
             if action == "skip" then
                 stats.conflicts_skipped = stats.conflicts_skipped + 1
                 next_one()
@@ -251,6 +509,7 @@ local function resolve_conflicts_interactive(plan_obj, conflicts, stats, on_done
                 {{ text = _("Keep remote (download)"),  callback = function() pick("download") end }},
                 {{ text = _("Skip"),                    callback = function() pick("skip")     end }},
             },
+            tap_close_callback = function() pick("skip", true) end,
         }
         UIManager:show(dialog)
     end
@@ -377,21 +636,43 @@ local function run_planned(plan_fn, ctx, opts)
         if on_done then on_done() end
     end
 
-    if #conflicts == 0 then
-        finish()
+    local function do_conflicts()
+        if #conflicts == 0 then
+            finish()
+            return
+        end
+        logger.info(string.format(
+            "webdav_autosync: %s surfacing conflicts count=%d",
+            plan_failure_label, #conflicts))
+        resolve_conflicts_interactive(plan_obj, conflicts, stats, finish)
+    end
+
+    -- Deletions run before conflicts (action loop → deletions → conflicts →
+    -- summary). Filter out any entry touching the currently open document
+    -- first — those re-surface next sync.
+    local deletions = filter_open_document_deletions(
+        plan_obj.actions.deletions or {}, plan_obj.local_folder, opts.open_document_path)
+    if #deletions == 0 then
+        do_conflicts()
         return
     end
 
+    local local_gone, remote_gone = 0, 0
+    for _, d in ipairs(deletions) do
+        if d.kind == "local_gone" then local_gone = local_gone + 1
+        else remote_gone = remote_gone + 1 end
+    end
     logger.info(string.format(
-        "webdav_autosync: %s surfacing conflicts count=%d",
-        plan_failure_label, #conflicts))
-    resolve_conflicts_interactive(plan_obj, conflicts, stats, finish)
+        "webdav_autosync: deletions detected local_gone=%d remote_gone=%d",
+        local_gone, remote_gone))
+    resolve_deletions_interactive(plan_obj, deletions, stats, do_conflicts)
 end
 
 return {
     run_planned = run_planned,
     run_one_way = run_one_way,
     resolve_conflicts_interactive = resolve_conflicts_interactive,
+    resolve_deletions_interactive = resolve_deletions_interactive,
     init_stats_from_plan = init_stats_from_plan,
     run_action_loop = run_action_loop,
     make_empty_chain_stats = make_empty_chain_stats,
