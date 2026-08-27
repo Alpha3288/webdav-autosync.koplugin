@@ -11,11 +11,11 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
-local settings = require("settings")
-local triggers = require("triggers")
-local runner = require("runner")
-local sync = require("sync")
-local ui = require("ui")
+local settings = require("wdas_settings")
+local triggers = require("wdas_triggers")
+local runner = require("wdas_runner")
+local sync = require("wdas_sync")
+local ui = require("wdas_ui")
 local T = require("ffi/util").template
 local _ = require("gettext")
 
@@ -95,9 +95,14 @@ function WebDAVSync:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("WebDAV server"),
+                text_func = function()
+                    local url = settings.get("server_url", "") or ""
+                    if url == "" then return _("WebDAV server: not set") end
+                    return T(_("WebDAV server: %1"), url)
+                end,
                 keep_menu_open = true,
                 callback = function() ui.set_webdav_server(self) end,
+                help_text = _("This URL is the root of the mirror, not just a host to reach. The download folder's tree is recreated directly underneath it, so pointing at an account root scatters books across the whole account. Give it a dedicated folder, e.g. https://example.com/dav/books."),
             },
             {
                 text = _("Import from KOReader cloud storage"),
@@ -105,14 +110,27 @@ function WebDAVSync:addToMainMenu(menu_items)
                 callback = function() ui.import_from_cloud_storage(self) end,
             },
             {
-                text = _("Choose download folder"),
+                text_func = function()
+                    local dir = settings.get("download_folder", "") or ""
+                    if dir == "" then return _("Download folder: not set") end
+                    return T(_("Download folder: %1"), dir)
+                end,
                 keep_menu_open = true,
                 callback = function() ui.set_download_folder(self) end,
+                help_text = _("The local side of the mirror. Everything under it that matches the extension filter is synced, subfolders included, so pick a books-only folder rather than the device root."),
             },
             {
-                text = _("Set file extensions (optional)"),
+                text_func = function()
+                    local ext = (settings.get("file_extensions", "") or ""):gsub("^%s*(.-)%s*$", "%1")
+                    if ext == "" then
+                        return T(_("File extensions: all %1 supported formats"),
+                            tostring(#sync.KOREADER_DEFAULT_EXTENSIONS))
+                    end
+                    return T(_("File extensions: %1"), ext)
+                end,
                 keep_menu_open = true,
                 callback = function() ui.set_file_extensions(self) end,
+                help_text = _("Which book files sync. Left empty this means every format KOReader can open -- including txt, html, htm, md, doc, rtf and zip, which also match plenty of non-book files. Narrow it (e.g. \"epub, pdf\") when the download folder holds anything besides books. Reading-progress sync ignores this filter."),
             },
             {
                 text = _("Two-way book sync (upload local changes)"),

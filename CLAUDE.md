@@ -45,18 +45,18 @@ main.lua       Plugin entry point. WidgetContainer subclass, lifecycle hooks
                (resolve config, prompt for Wi-Fi if needed, dispatch into
                runner). Thin — no runners, no settings dialogs, no chain
                orchestrator.
-settings.lua   Cooldown bounds + bounded getters, prefixed get/save against
+wdas_settings.lua   Cooldown bounds + bounded getters, prefixed get/save against
                G_reader_settings, master+event gating, cooldown bookkeeping
                (should_run_auto, mark_auto_run, should_run_close, mark_close_run),
                state-file accessors (read_state, write_state — module-local).
-triggers.lua   Resume defer + cancel, Kindle powerd unscheduled-wake classifier,
+wdas_triggers.lua   Resume defer + cancel, Kindle powerd unscheduled-wake classifier,
                online-defer poll, in-flight lock, schedule_startup_sync,
                run_resume_sync / run_startup_sync (fire-time gating),
                dispatch_auto_chain (3-branch chain orchestrator). Owns
                sync_in_flight, pending_resume_sync_fn, startup_sync_scheduled
                module-locals (shared between FM and Reader plugin instances
                via Lua's require cache).
-runner.lua     run_planned (parameterized planner runner — replaces the
+wdas_runner.lua     run_planned (parameterized planner runner — replaces the
                three legacy runners), run_one_way (legacy download-only
                wrapper), conflict dialog chain, summary formatters
                (per-runner show_summary, chain show_chain_summary),
@@ -66,18 +66,18 @@ runner.lua     run_planned (parameterized planner runner — replaces the
                chain (resolve_deletions_interactive — batch + per-file
                review, run before conflicts), library refresh
                broadcast (notify_library_refresh).
-ui.lua         Settings dialogs: set_webdav_server, import_from_cloud_storage,
+wdas_ui.lua         Settings dialogs: set_webdav_server, import_from_cloud_storage,
                set_download_folder, set_file_extensions, the three SpinWidget
                settings (cooldown, close-cooldown, resume-settle, all
                backed by one make_spin_setting helper), help text.
-sync.lua       Books: run_sync (one-way) | plan (two-way).
+wdas_sync.lua       Books: run_sync (one-way) | plan (two-way).
                Progress: plan_progress (full library) | plan_progress_book
                (one book).
                Shared: diff_indices (opt-in deletion collection),
                do_action (download/upload/delete_remote/delete_local),
                prune_empty_local_dirs, save_cache, rel_is_safe
                (path-traversal rejection).
-webdav.lua     WebDAV client (PROPFIND list/get_props, GET download, PUT
+wdas_webdav.lua     WebDAV client (PROPFIND list/get_props, GET download, PUT
                upload, MKCOL ensure_remote_dirs, DELETE delete +
                prune_empty_remote_dirs); private do_request helper
                threads socketutil's timeout pair around each call.
@@ -100,7 +100,7 @@ Two independent persistent cooldowns gate auto syncs:
 - **The two cooldowns are fully independent.** A close at t=10 doesn't push back the next Resume sync, and vice versa. Manual entries bump only the full-reconcile timestamp — close path is too cheap to bother suppressing.
 - **Per-book carve-out for close**: `should_run_close(book_rel)` returns true unconditionally for a different book — only consecutive closes of the *same* book are debounced.
 - Cooldown checks live at the event-handler level. Once a chain (e.g. Resume's progress → book sync via `on_done`) is admitted, it runs to completion under one cooldown slot.
-- **Startup `scheduleIn` runs at most once per KOReader process** (`startup_sync_scheduled` module-local boolean in `triggers.lua`). KOReader instantiates the plugin separately under `FileManager` and `ReaderUI`; without the guard, every FM↔Reader transition outside the cooldown window fires a full-library sync. The boolean is module-local (shared across FM and Reader instances since `require("triggers")` returns the same module table). Don't re-run startup sync on Reader→FM transitions — Resume covers wake-from-sleep, manual entries cover everything else, and the close trigger already pushed the just-edited book.
+- **Startup `scheduleIn` runs at most once per KOReader process** (`startup_sync_scheduled` module-local boolean in `wdas_triggers.lua`). KOReader instantiates the plugin separately under `FileManager` and `ReaderUI`; without the guard, every FM↔Reader transition outside the cooldown window fires a full-library sync. The boolean is module-local (shared across FM and Reader instances since `require("triggers")` returns the same module table). Don't re-run startup sync on Reader→FM transitions — Resume covers wake-from-sleep, manual entries cover everything else, and the close trigger already pushed the just-edited book.
 - Don't reintroduce per-sync-kind cooldowns (book vs progress) or per-session booleans — the split is per-*trigger-kind* (close vs everything-else).
 
 ### Trigger UI policy: manual vs auto
@@ -119,7 +119,7 @@ The full-library reconciles (`onResume`, `init()` startup, manual menu) walk via
   - **Kindle-only** — at fire time, `triggers.is_unscheduled_kindle_wake()` reads `Device:getPowerDevice():getPowerdState()`. If state is `screenSaver` or `suspended`, the wake was unscheduled (matches `KindlePowerD:checkUnexpectedWakeup` at `frontend/device/kindle/powerd.lua:258-269`, which itself uses a 15 s window — that's why the default `DEFAULT_RESUME_SETTLE=15`). Skip with `skip reason=unscheduled-wake state=…`. Non-Kindle devices fall through (`triggers.read_powerd_state` returns nil).
   - **Why both**: cross-platform mechanism is a fallback for devices where we can't read the canonical state; the Kindle gate is the explicit path with a clear log line. The kicker is **NO_FRAMEWORK Kindles** (`koreader.sh --framework_stop`): with the Lab126 framework killed, the screensaver blanket unloaded, and `userpasswdenabled` deleted to prevent it inhibiting `outOfScreenSaver` (`platform/kindle/koreader.sh:201-207`), every powerd-reported wake propagates straight to `Resume` without the framework filtering brief system wakes. The defer is more pressing there than on stock-framework Kindles.
   - **User-configurable via `setResumeSettle`** — `webdav_autosync_resume_settle_seconds` (0–60 s, step 5, default 15). Setting to 0 takes the inline path: `onResume` calls `triggers.run_resume_sync(nil, { skip_unscheduled_check = true })` directly. The skip flag is necessary because at t=0 powerd state on Kindle is *always* `screenSaver` right at wake — the Kindle gate would otherwise classify every Resume as unscheduled. Setting the delay to 0 mid-defer also calls `triggers.cancel_pending_resume_sync` so a pending fn from before the change doesn't fire under the now-stale gate assumption.
-  - **Single pending fn shared across instances** — `pending_resume_sync_fn` is module-local in `triggers.lua` (FM and Reader instances share it). `onResume`'s "skip reason=already-scheduled" branch keeps repeated Resume broadcasts inside the settle window from double-scheduling.
+  - **Single pending fn shared across instances** — `pending_resume_sync_fn` is module-local in `wdas_triggers.lua` (FM and Reader instances share it). `onResume`'s "skip reason=already-scheduled" branch keeps repeated Resume broadcasts inside the settle window from double-scheduling.
   - Don't reintroduce inline-on-Resume sync as the default; the defer is the whole point of the change. The 0 opt-out is for users who want pre-1.7.8 behavior.
 - **Offline handling for auto interactive triggers** — Resume and startup poll `NetworkMgr:isOnline()` AND `NetworkMgr:hasDefaultRoute()` themselves with bounded retries (`triggers.defer_until_online`, 6 × 5 s = ~30 s, then silent give-up: `skip reason=offline-give-up online=… has_route=…`). Defer happens *after* toggle, cooldown, and Kindle-state gates; cooldown is consumed (`settings.mark_auto_run()`) only after all of them pass, so a Wi-Fi-still-reconnecting Resume doesn't burn the next 5 min.
   - **Why both `isOnline` + `hasDefaultRoute`**: `isOnline()` is `canResolveHostnames()` (DNS probe to `dns.msftncsi.com`) — DNS can succeed against cached records before the kernel routing table is populated. The post-suspend race: DNS comes back first, helper returns "online", `mark_auto_run()` fires, then PROPFIND fails with "Network is unreachable" and the cooldown is burned for nothing. `hasDefaultRoute()` (UDP `setpeername` to a doc-range IP) catches that case. The defer/give-up log lines report both flags.
@@ -140,7 +140,7 @@ The full-library reconciles (`onResume`, `init()` startup, manual menu) walk via
 
 ### WebDAV client conventions
 
-- **`webdav.lua` mirrors KOReader's `apps/cloudstorage/webdavapi.lua`**: trailing slash required for PROPFIND, minimal `<allprop/>` body, `user`/`password` go in the request table (not as an `Authorization: Basic …` header), timeouts use `socketutil:set_timeout()`. Diverging has historically broken servers like Nextcloud — keep parity.
+- **`wdas_webdav.lua` mirrors KOReader's `apps/cloudstorage/webdavapi.lua`**: trailing slash required for PROPFIND, minimal `<allprop/>` body, `user`/`password` go in the request table (not as an `Authorization: Basic …` header), timeouts use `socketutil:set_timeout()`. Diverging has historically broken servers like Nextcloud — keep parity.
 - **`webdav.list_all` fast path** — one PROPFIND with `Depth: infinity` returns the entire subtree in one round trip (5–50× faster than recursive Depth: 1 for `plan_progress`). When the server refuses (some hosted providers return `403`/`507`/`501`/etc.) the call falls back to recursive Depth: 1 walk and memos the host in `infinity_unsupported` (in-process, cleared at restart). Non-HTTP failures (timeout, DNS, auth) are *not* memoed — surface them immediately. Both paths are parsed by the same `parse_propfind_response` and obey the same self-skip rule.
 - **Recursion in `webdav.list_all` fallback** — one PROPFIND per directory with `Depth: 1`. Self-skip (`e_path_norm ~= url_path`) prevents infinite recursion. Two encoding invariants:
   - Recursion URLs use `e.href_raw` (wire-format, percent-encoded), **not** decoded `e.href`. Some servers return 400 on literal spaces or unescaped reserved chars — don't decode the href before recursing.
@@ -187,7 +187,7 @@ Opt-in via `webdav_autosync_books_two_way`; only affects book sync (progress syn
 
 Opt-in, gated by per-event toggles `webdav_autosync_progress_on_{startup,resume,close}` plus master, all default off.
 
-- Reuses two-way machinery via `sync.plan_progress` and `sync.plan_progress_book`; `do_action`, `save_cache`, `runner.resolve_conflicts_interactive` are shared with book sync without modification. Shared `diff_indices` helper in `sync.lua` is what makes that work — the three planners only differ in how they build the remote/local indices.
+- Reuses two-way machinery via `sync.plan_progress` and `sync.plan_progress_book`; `do_action`, `save_cache`, `runner.resolve_conflicts_interactive` are shared with book sync without modification. Shared `diff_indices` helper in `wdas_sync.lua` is what makes that work — the three planners only differ in how they build the remote/local indices.
 - **Triggered by**: `onCloseDocument` (auto, scoped via `plan_progress_book`), `onResume` (auto, full reconcile), `init()` (auto, full reconcile). Manual `webdav_progress_sync_now` Dispatcher action and "Sync reading progress now" menu item bypass cooldown + toggles. All four route through `runner.resolve_conflicts_interactive` for conflicts (no longer deferred from close).
 - **Why close is scoped, not full-library**: rate-limited providers returned 400s on full PROPFIND-on-every-close. Close walks only `<book>.sdr/` — one round-trip. Don't expand back to a full walk without proving the rate-limit story has changed.
 - **Sidecar location requirement**: only KOReader's default `document_metadata_folder = "doc"` is supported (only mode that places `.sdr` inside the synced library tree). With `dir` or `hash` modes, sidecars are off-tree with no remote mapping; silent triggers no-op (one debug log line), interactive manual triggers show an `InfoMessage`.
@@ -215,7 +215,7 @@ Every log line starts with `webdav_autosync:` so it can be greppd from `crash.lo
 
 ## Releases
 
-A tag matching `v*` triggers `.github/workflows/release.yml`, which builds `webdav-autosync.koplugin-<tag>.zip` (runtime files only: `_meta.lua`, `main.lua`, `settings.lua`, `triggers.lua`, `runner.lua`, `ui.lua`, `sync.lua`, `webdav.lua`, `LICENSE`, `README.md` — dev tooling like `Makefile`, `selene.toml`, `koreader.yml`, `.editorconfig`, `CLAUDE.md` excluded) and publishes a GitHub Release with auto-generated notes.
+A tag matching `v*` triggers `.github/workflows/release.yml`, which builds `webdav-autosync.koplugin-<tag>.zip` (runtime files only: `_meta.lua`, `main.lua`, `wdas_settings.lua`, `wdas_triggers.lua`, `wdas_runner.lua`, `wdas_ui.lua`, `wdas_sync.lua`, `wdas_webdav.lua`, `LICENSE`, `README.md` — dev tooling like `Makefile`, `selene.toml`, `koreader.yml`, `.editorconfig`, `CLAUDE.md` excluded) and publishes a GitHub Release with auto-generated notes.
 
 The workflow guards against tag/version drift: tag (without leading `v`) must match `version` in `_meta.lua` or it fails fast. To cut a release: bump `_meta.lua` `version`, commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
 

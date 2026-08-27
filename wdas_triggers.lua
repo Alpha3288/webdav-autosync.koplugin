@@ -26,7 +26,7 @@ local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
 local logger = require("logger")
 local _ = require("gettext")
-local settings = require("settings")
+local settings = require("wdas_settings")
 
 local AUTO_TRIGGER_NET_RETRY_INTERVAL_SECS = 5
 local AUTO_TRIGGER_NET_RETRY_MAX = 6  -- ~30 s total
@@ -106,7 +106,7 @@ end
 -- ---------- chain orchestrator ----------
 
 local function dispatch_auto_chain(opts)
-    local runner = require("runner")
+    local runner = require("wdas_runner")
     local trigger = opts.trigger
     local progress_on = opts.progress_on
     local books_on = opts.books_on

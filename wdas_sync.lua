@@ -24,7 +24,7 @@ local LuaSettings = require("luasettings")
 local DataStorage = require("datastorage")
 local logger = require("logger")
 local util = require("util")
-local webdav = require("webdav")
+local webdav = require("wdas_webdav")
 
 
 --- File extensions KOReader supports (default when user leaves filter empty).
