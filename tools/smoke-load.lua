@@ -69,7 +69,7 @@ G_reader_settings = setmetatable({
     flipNilOrFalse = function() end,
 }, {})
 
-local modules = { "settings", "triggers", "runner", "ui", "sync", "webdav" }
+local modules = { "wdas_settings", "wdas_triggers", "wdas_runner", "wdas_ui", "wdas_sync", "wdas_webdav" }
 local failed = false
 for _, m in ipairs(modules) do
     local ok, err = pcall(require, m)
@@ -84,4 +84,55 @@ end
 if failed then
     os.exit(1)
 end
+
+-- Static namespace guard.
+--
+-- KOReader loads every plugin into a single Lua state, so `package.loaded` is
+-- one shared namespace. Whichever plugin requires a given module name first
+-- wins, and plugins load alphabetically. A module named `settings` or `sync`
+-- is therefore not ours by default -- another plugin can already own it, and
+-- our require() silently returns *their* table. Nothing fails at load time;
+-- the device black-screens later, on the first field access.
+--
+-- Runtime probing cannot catch this reliably (the bad table loads fine), so
+-- assert the invariant on the sources instead: every module this plugin ships
+-- is prefixed, and is required only under that prefix.
+local PREFIX = "wdas_"
+local function check_namespace()
+    local own, bad = {}, false
+    local ls = io.popen("ls *.lua 2>/dev/null")
+    for name in ls:lines() do
+        local base = name:match("^(.+)%.lua$")
+        if base ~= "main" and base ~= "_meta" then
+            if not base:find("^" .. PREFIX) then
+                print("FAIL namespace: " .. name .. " ships an unprefixed module name")
+                bad = true
+            end
+            own[base] = true
+        end
+    end
+    ls:close()
+
+    local files = io.popen("ls *.lua 2>/dev/null")
+    for name in files:lines() do
+        local fh = io.open(name)
+        local src = fh:read("*a")
+        fh:close()
+        for req in src:gmatch('require%("([%w_]+)"%)') do
+            if own[PREFIX .. req] and not req:find("^" .. PREFIX) then
+                print("FAIL namespace: " .. name .. ' requires "' .. req
+                      .. '" -- must be "' .. PREFIX .. req .. '"')
+                bad = true
+            end
+        end
+    end
+    files:close()
+    return not bad
+end
+
+if not check_namespace() then
+    os.exit(1)
+end
+print("ok   module namespace (all own modules prefixed \"" .. PREFIX .. "\")")
+
 print("all modules loaded successfully")

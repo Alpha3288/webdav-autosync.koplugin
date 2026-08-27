@@ -26,8 +26,8 @@ local InfoMessage = require("ui/widget/infomessage")
 local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
 local Event = require("ui/event")
 local logger = require("logger")
-local sync = require("sync")
-local triggers = require("triggers")
+local sync = require("wdas_sync")
+local triggers = require("wdas_triggers")
 local T = require("ffi/util").template
 local _ = require("gettext")
 

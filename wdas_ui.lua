@@ -17,9 +17,9 @@ local InfoMessage = require("ui/widget/infomessage")
 local TextViewer = require("ui/widget/textviewer")
 local SpinWidget = require("ui/widget/spinwidget")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
-local settings = require("settings")
-local triggers = require("triggers")
-local webdav = require("webdav")
+local settings = require("wdas_settings")
+local triggers = require("wdas_triggers")
+local webdav = require("wdas_webdav")
 local T = require("ffi/util").template
 local _ = require("gettext")
 
