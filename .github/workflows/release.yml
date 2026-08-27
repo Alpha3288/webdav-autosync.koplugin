@@ -31,8 +31,8 @@ jobs:
           plugin_dir="webdav-autosync.koplugin"
           zip_name="${plugin_dir}-${GITHUB_REF_NAME}.zip"
           mkdir -p "build/${plugin_dir}"
-          cp _meta.lua main.lua settings.lua triggers.lua runner.lua ui.lua \
-             sync.lua webdav.lua LICENSE README.md "build/${plugin_dir}/"
+          cp _meta.lua main.lua wdas_settings.lua wdas_triggers.lua wdas_runner.lua wdas_ui.lua \
+             wdas_sync.lua wdas_webdav.lua LICENSE README.md "build/${plugin_dir}/"
           (cd build && zip -r "../${zip_name}" "${plugin_dir}")
           echo "zip_name=${zip_name}" >> "$GITHUB_OUTPUT"
 
