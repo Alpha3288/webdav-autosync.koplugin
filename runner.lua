@@ -280,13 +280,7 @@ end
 -- the folder. Used to protect the open book (and its `<book>.sdr/`) from
 -- deletion propagation.
 local function open_document_rel(local_folder, open_document_path)
-    if type(open_document_path) ~= "string" or open_document_path == "" then return nil end
-    if type(local_folder) ~= "string" or local_folder == "" then return nil end
-    local root = local_folder:gsub("/+$", "")
-    if open_document_path:sub(1, #root + 1) ~= root .. "/" then return nil end
-    local rel = open_document_path:sub(#root + 2)
-    if rel == "" then return nil end
-    return rel
+    return sync.rel_under_folder(local_folder, open_document_path)
 end
 
 -- True when a deletion entry's rel belongs to the open book — either the book

@@ -603,6 +603,21 @@ local function build_remote_index(list, server_url, keep)
     return index
 end
 
+--- Rel of `file` under `local_folder`, or nil when it lives outside. Both
+--- sides go through realpath first so a symlinked folder setting (Android's
+--- /sdcard vs the /storage/emulated/0 path the reader reports) still matches.
+local function rel_under_folder(local_folder, file)
+    if type(local_folder) ~= "string" or local_folder == "" then return nil end
+    if type(file) ~= "string" or file == "" then return nil end
+    local realpath = require("ffi/util").realpath
+    local root = (realpath(local_folder) or local_folder):gsub("/+$", "")
+    local path = realpath(file) or file
+    if path:sub(1, #root + 1) ~= root .. "/" then return nil end
+    local rel = path:sub(#root + 2)
+    if rel == "" then return nil end
+    return rel
+end
+
 --- Validate inputs shared by plan / plan_progress. Returns local_folder
 --- (trimmed) on success, or nil + error string.
 local function validate_two_way_inputs(server_url, local_folder)
@@ -905,6 +920,7 @@ local function save_cache(p)
 end
 
 return {
+    rel_under_folder = rel_under_folder,
     run_sync = run_sync,
     plan = plan,
     plan_progress = plan_progress,

@@ -198,6 +198,10 @@ end
 -- per-file dialog (1.8.0+ — pre-1.8.0 they were deferred to the next
 -- interactive trigger).
 function WebDAVSync:onCloseDocument()
+    if self.reloading_for_sync then
+        logger.dbg("webdav_autosync: trigger=close skip reason=sync-reload")
+        return
+    end
     if not settings.event_enabled("progress_on_close") then
         logger.dbg("webdav_autosync: trigger=close skip reason=disabled")
         return
@@ -213,18 +217,12 @@ function WebDAVSync:onCloseDocument()
         logger.dbg("webdav_autosync: trigger=close skip reason=no-download-folder")
         return
     end
-    local trimmed = local_folder:gsub("/+$", "")
-
     -- Book opened from outside the synced library — no remote mapping; no-op.
     -- Don't fall back to a full-library walk on close, that defeats the
     -- whole reason this trigger is scoped.
-    if doc.file:sub(1, #trimmed + 1) ~= trimmed .. "/" then
+    local book_rel = sync.rel_under_folder(local_folder, doc.file)
+    if not book_rel then
         logger.dbg("webdav_autosync: trigger=close skip reason=outside-library file=" .. tostring(doc.file))
-        return
-    end
-    local book_rel = doc.file:sub(#trimmed + 2)
-    if book_rel == "" then
-        logger.dbg("webdav_autosync: trigger=close skip reason=empty-relpath")
         return
     end
 
@@ -367,7 +365,44 @@ function WebDAVSync:maybeRunBookAutoSync(opts)
     })
 end
 
+function WebDAVSync:flushOpenDocument()
+    if self.ui and self.ui.document and self.ui.saveSettings then
+        self.ui:saveSettings()
+    end
+end
+
+local function read_file(path)
+    local f = path and io.open(path, "rb")
+    if not f then return nil end
+    local data = f:read("*a")
+    f:close()
+    return data
+end
+
+function WebDAVSync:openDocumentSidecar()
+    local doc = self.ui and self.ui.document
+    if not (doc and doc.file) then return nil end
+    local DocSettings = require("docsettings")
+    return DocSettings:getSidecarDir(doc.file, "doc") .. "/" .. DocSettings.getSidecarFilename(doc.file)
+end
+
+function WebDAVSync:reloadIfSidecarChanged(sidecar, before)
+    if not (sidecar and self.ui and self.ui.document and self.ui.reloadDocument) then return end
+    local after = read_file(sidecar)
+    if not after or after == before then return end
+    logger.info("webdav_autosync: open book progress downloaded, reloading document")
+    self.reloading_for_sync = true
+    self.ui:reloadDocument(function()
+        local f = io.open(sidecar, "wb")
+        if f then
+            f:write(after)
+            f:close()
+        end
+    end)
+end
+
 function WebDAVSync:doProgressSync(opts)
+    self:flushOpenDocument()
     opts = opts or {}
     local manual = opts.manual == true
     local on_done = opts.on_done
@@ -408,6 +443,8 @@ function WebDAVSync:doProgressSync(opts)
     local function dispatch()
         local username = settings.get("username", "")
         local password = settings.get("password", "")
+        local sidecar = self:openDocumentSidecar()
+        local sidecar_before = read_file(sidecar)
         logger.info("webdav_autosync: progress sync start")
         local ctx = {
             server_url = server_url,
@@ -433,6 +470,11 @@ function WebDAVSync:doProgressSync(opts)
                         "webdav_autosync: progress sync done downloaded=%d uploaded=%d unchanged=%d baselined=%d conflicts_skipped=%d failed=%d",
                         stats.downloaded, stats.uploaded, stats.unchanged, stats.baselined,
                         stats.conflicts_skipped, stats.failed))
+                    if sidecar and stats.downloaded > 0 then
+                        UIManager:nextTick(function()
+                            self:reloadIfSidecarChanged(sidecar, sidecar_before)
+                        end)
+                    end
                 end,
             })
     end
@@ -464,6 +506,7 @@ end
 
 function WebDAVSync:doProgressSyncForBook(book_rel)
     if triggers.check_in_flight("close-trigger sync", false) then return end
+    self:flushOpenDocument()
 
     local meta_mode = G_reader_settings and G_reader_settings:readSetting("document_metadata_folder") or "doc"
     if meta_mode ~= "doc" then
